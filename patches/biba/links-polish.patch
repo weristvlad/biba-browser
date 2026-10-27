@@ -505,3 +505,14 @@
  };
  
  #endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_BIBA_PINNED_LINKS_VIEW_H_
+--- a/components/helium_onboarding/helium_onboarding_strings.grdp
++++ b/components/helium_onboarding/helium_onboarding_strings.grdp
+@@ -51,7 +51,7 @@
+   Helium services
+ </message>
+ <message name="IDS_HELIUM_ONBOARDING_SERVICES_SUBTITLE" desc="Subtitle explaining when Helium services consent choices take effect.">
+-  Services are not active until you consent to using them. Changes will be applied after you go to the next page.
++  Biba is built on Helium, an open-source browser by the Helium team, and uses their services for things like extension downloads and filter lists. Services are not active until you consent to using them. Changes will be applied after you go to the next page.
+ </message>
+ <message name="IDS_HELIUM_ONBOARDING_SERVICES_CONNECTION_TITLE" desc="Title of the global toggle for connecting to Helium services.">
+   Allow connecting to Helium services
