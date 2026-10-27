@@ -1,0 +1,19 @@
+--- a/components/url_formatter/url_formatter.cc
++++ b/components/url_formatter/url_formatter.cc
+@@ -633,8 +633,14 @@
+       replacements.SetSchemeStr("biba");
+       url_ = url.ReplaceComponents(replacements);
+ 
+-      return FormatUrlWithAdjustments(url_, format_types, unescape_rules,
+-                                      new_parsed, prefix_end, adjustments);
++      std::u16string formatted = FormatUrlWithAdjustments(
++          url_, format_types, unescape_rules, new_parsed, prefix_end,
++          adjustments);
++      // "biba" is shorter than "chrome": record that, so offsets into the
++      // original URL (omnibox match highlighting) still line up.
++      base::OffsetAdjuster::MergeSequentialAdjustments(
++          {{0, url.scheme().size(), url_.scheme().size()}}, adjustments);
++      return formatted;
+     }
+   }
+ 
