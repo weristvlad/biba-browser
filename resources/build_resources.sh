@@ -71,4 +71,8 @@ out.alpha_composite(glyph, (2, 2))
 out.save(sys.argv[2])
 EOF2
 
+# --- favicon (the "b" alone, for the new tab / setup pages) ----------------
+mkdir -p "$out/favicon"
+[ -n "${logo_png:-}" ] && "$py" -I "$here/make_favicon.py" "$logo_png" "$out/favicon/fav"
+
 echo "Biba resources built in $out"
