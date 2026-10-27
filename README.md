@@ -63,8 +63,13 @@ Beta, macOS (Apple Silicon) first. Things that are still rough:
 ## Install
 
 Grab the latest `.dmg` from
-[Releases](https://github.com/weristvlad/biba-browser/releases), drag Biba to
-Applications. Biba checks for updates on its own.
+[Releases](https://github.com/weristvlad/biba-browser/releases) or
+[bibabrowser.com](https://bibabrowser.com), drag Biba to Applications. Biba
+isn't notarized yet, so the first time right-click it and choose **Open**.
+After that it updates itself from GitHub Releases (Sparkle, EdDSA-signed).
+
+To publish a release: `scripts/release.sh <version> --publish` builds,
+packages, signs the update and uploads the DMG plus `appcast-arm64.xml`.
 
 ## Building
 
