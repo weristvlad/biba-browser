@@ -17,3 +17,22 @@
      }
    }
  
+--- a/components/omnibox/browser/history_url_provider.cc
++++ b/components/omnibox/browser/history_url_provider.cc
+@@ -469,8 +469,14 @@
+     what_you_typed_match.fill_into_edit = fixed_up_input.text();
+     what_you_typed_match.inline_autocompletion =
+         fixed_up_input.text().substr(autocomplete_input.text().size());
+-    what_you_typed_match.contents_class.push_back(
+-        {autocomplete_input.text().length(), ACMatchClassification::URL});
++    // Biba: highlight just what was typed. Appending a URL class after the
++    // existing ones breaks their order when fix-up lengthened the text
++    // ("biba:" -> "biba://version"), which crashes on validation.
++    TermMatches typed = {{0, 0, autocomplete_input.text().length()}};
++    what_you_typed_match.contents_class = ClassifyTermMatches(
++        typed, what_you_typed_match.contents.size(),
++        ACMatchClassification::MATCH | ACMatchClassification::URL,
++        ACMatchClassification::URL);
+   }
+ 
+   what_you_typed_match.relevance = CalculateRelevance(WHAT_YOU_TYPED, 0);
