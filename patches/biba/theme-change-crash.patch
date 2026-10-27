@@ -1,0 +1,134 @@
+--- a/chrome/browser/ui/views/frame/biba_frame_paint.cc
++++ b/chrome/browser/ui/views/frame/biba_frame_paint.cc
+@@ -426,7 +426,7 @@
+   }
+   MaybeSamplePageTop(contents, toolbar);
+ 
+-  const ui::ColorProvider* override = nullptr;
++  std::optional<ui::ColorProviderKey> override;
+   if (const std::optional<SkColor> site = PageTopColor(contents)) {
+     const bool window_dark = color_utils::IsDark(
+         widget->GetColorProvider()->GetColor(kColorToolbar));
+@@ -435,7 +435,7 @@
+       ui::ColorProviderKey key = widget->GetColorProviderKeyForTesting();
+       key.color_mode = page_dark ? ui::ColorProviderKey::ColorMode::kDark
+                                  : ui::ColorProviderKey::ColorMode::kLight;
+-      override = ui::ColorProviderManager::Get().GetColorProviderFor(key);
++      override = key;
+     }
+   }
+   bool changed = false;
+--- a/ui/views/biba_color_override.cc
++++ b/ui/views/biba_color_override.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "base/memory/raw_ptr.h"
+ #include "base/no_destructor.h"
++#include "ui/color/color_provider_manager.h"
+ #include "ui/views/view.h"
+ #include "ui/views/view_observer.h"
+ 
+@@ -19,8 +20,8 @@
+ // Drops the override when its view goes away.
+ class OverrideEntry : public ViewObserver {
+  public:
+-  OverrideEntry(View* view, const ui::ColorProvider* provider)
+-      : view_(view), provider_(provider) {
++  OverrideEntry(View* view, const ui::ColorProviderKey& key)
++      : view_(view), key_(key) {
+     view_->AddObserver(this);
+   }
+   ~OverrideEntry() override {
+@@ -29,14 +30,18 @@
+     }
+   }
+ 
+-  const ui::ColorProvider* provider() const { return provider_; }
+-  void set_provider(const ui::ColorProvider* provider) { provider_ = provider; }
++  const ui::ColorProviderKey& key() const { return key_; }
++  void set_key(const ui::ColorProviderKey& key) { key_ = key; }
++  // Looked up on each use; the manager may have rebuilt its providers.
++  const ui::ColorProvider* provider() const {
++    return ui::ColorProviderManager::Get().GetColorProviderFor(key_);
++  }
+ 
+   void OnViewIsDeleting(View* observed_view) override;
+ 
+  private:
+   raw_ptr<View> view_;
+-  raw_ptr<const ui::ColorProvider> provider_;
++  ui::ColorProviderKey key_;
+ };
+ 
+ std::map<const View*, std::unique_ptr<OverrideEntry>>& Overrides() {
+@@ -54,26 +59,30 @@
+ }  // namespace
+ 
+ void SetBibaColorProviderOverride(View* view,
+-                                  const ui::ColorProvider* provider) {
++                                  std::optional<ui::ColorProviderKey> key) {
+   auto& overrides = Overrides();
+   auto it = overrides.find(view);
+-  if (!provider) {
++  if (!key) {
+     if (it != overrides.end()) {
+       overrides.erase(it);
+     }
+     return;
+   }
+   if (it != overrides.end()) {
+-    it->second->set_provider(provider);
++    it->second->set_key(*key);
+   } else {
+-    overrides.emplace(view, std::make_unique<OverrideEntry>(view, provider));
++    overrides.emplace(view, std::make_unique<OverrideEntry>(view, *key));
+   }
+ }
+ 
+-const ui::ColorProvider* GetBibaColorProviderOverride(const View* view) {
++std::optional<ui::ColorProviderKey> GetBibaColorProviderOverride(
++    const View* view) {
+   const auto& overrides = Overrides();
+   auto it = overrides.find(view);
+-  return it == overrides.end() ? nullptr : it->second->provider();
++  if (it == overrides.end()) {
++    return std::nullopt;
++  }
++  return it->second->key();
+ }
+ 
+ const ui::ColorProvider* FindBibaColorProviderOverride(const View* view) {
+--- a/ui/views/biba_color_override.h
++++ b/ui/views/biba_color_override.h
+@@ -5,6 +5,9 @@
+ #ifndef UI_VIEWS_BIBA_COLOR_OVERRIDE_H_
+ #define UI_VIEWS_BIBA_COLOR_OVERRIDE_H_
+ 
++#include <optional>
++
++#include "ui/color/color_provider_key.h"
+ #include "ui/views/views_export.h"
+ 
+ namespace ui {
+@@ -17,12 +20,16 @@
+ 
+ // Biba: gives `view` and its descendants their own ColorProvider (e.g. the
+ // toolbar switching to dark colours over a dark page while the rest of the
+-// window stays light). nullptr removes the override. The override goes away
+-// by itself when `view` is deleted. Callers re-run OnThemeChanged() (e.g.
++// window stays light). std::nullopt removes the override. The override goes
++// away by itself when `view` is deleted. Callers re-run OnThemeChanged() (e.g.
+ // Widget::ThemeChanged()) so views pick the new colours up.
+-VIEWS_EXPORT void SetBibaColorProviderOverride(View* view,
+-                                               const ui::ColorProvider* provider);
+-VIEWS_EXPORT const ui::ColorProvider* GetBibaColorProviderOverride(
++//
++// The key is stored, not the provider: ColorProviderManager drops its cached
++// providers whenever the system theme changes, so a kept pointer would dangle.
++VIEWS_EXPORT void SetBibaColorProviderOverride(
++    View* view,
++    std::optional<ui::ColorProviderKey> key);
++VIEWS_EXPORT std::optional<ui::ColorProviderKey> GetBibaColorProviderOverride(
+     const View* view);
+ 
+ // The override that applies to `view`: its own or its nearest ancestor's.
