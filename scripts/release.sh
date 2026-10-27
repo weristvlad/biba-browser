@@ -2,8 +2,10 @@
 # Builds a Biba release for Apple Silicon, packages it as a DMG, signs the
 # update for Sparkle, writes the appcast and publishes a GitHub release.
 #
-# Usage: scripts/release.sh <version> [--publish]
+# Usage: scripts/release.sh <version> [--build-only|--no-build] [--publish]
 #   e.g. scripts/release.sh 0.1.0-beta.1 --publish
+#   --build-only  only build out/Release (the hours-long part), then stop
+#   --no-build    skip the build, sign/package/publish what's in out/Release
 #
 # Updates: Biba asks
 #   https://github.com/weristvlad/biba-browser/releases/latest/download/appcast-arm64.xml
@@ -16,7 +18,15 @@
 set -euo pipefail
 
 version=${1:?version, e.g. 0.1.0-beta.1}
-publish=${2:-}
+shift
+publish= stage=all
+for a in "$@"; do
+  case $a in
+    --publish) publish=--publish ;;
+    --build-only) stage=build ;;
+    --no-build) stage=package ;;
+  esac
+done
 H=${BIBA_HELIUM:-/Volumes/BibaBuild/biba/helium-macos}
 src="$H/build/src"
 out="$src/out/Release"
@@ -26,11 +36,11 @@ dist="$H/../dist/$version"
 mkdir -p "$dist"
 
 # Sparkle's command-line tools (generate_keys, sign_update), from the same
-# Sparkle release Helium bundles.
+# Sparkle release Helium bundles (downloads.ini).
 sparkle="${SPARKLE_DIR:-$HOME/.cache/biba/sparkle}/bin"
 if [ ! -x "$sparkle/sign_update" ]; then
   mkdir -p "$(dirname "$sparkle")"
-  curl -fsSL https://github.com/sparkle-project/Sparkle/releases/download/2.7.1/Sparkle-2.7.1.tar.xz \
+  curl -fsSL https://github.com/sparkle-project/Sparkle/releases/download/2.10.0/Sparkle-2.10.0.tar.xz \
     | tar -xJ -C "$(dirname "$sparkle")"
 fi
 pubkey=$("$sparkle/generate_keys" -p 2>/dev/null || true)
@@ -40,9 +50,12 @@ if [ -z "$pubkey" ]; then
 fi
 
 # --- build -------------------------------------------------------------------
+if [ "$stage" != package ]; then
 mkdir -p "$out"
 {
-  cat "$H/flags.macos.gn"
+  # Same as Helium's own release args (dev.sh write_gn_args "release").
+  cat "$H/helium-chromium/flags.gn" "$H/flags.macos.gn"
+  echo 'chrome_pgo_phase=2'
   echo 'is_component_build=false'
   echo 'enable_precompiled_headers=false'
   echo 'target_cpu="arm64"'
@@ -51,7 +64,13 @@ mkdir -p "$out"
   echo 'sparkle_automatic_checks=true'
   echo 'sparkle_check_interval=21600'
 } > "$out/args.gn"
-(cd "$H" && source ./dev.sh >/dev/null 2>&1; cd build/src && gn gen out/Release && autoninja -C out/Release chrome)
+# Helium's dev.sh is zsh and not `set -u` clean; its helium_build runs
+# autoninja (siso) on $_out_dir.
+(cd "$src" && buildtools/mac/gn gen out/Release)
+(cd "$H" && PATH="/opt/homebrew/opt/python@3.13/libexec/bin:$PATH" \
+  zsh -c 'source ./dev.sh >/dev/null 2>&1; _out_dir="$_src_dir/out/Release"; helium_build -k 0')
+fi
+[ "$stage" = build ] && { echo "Built $out"; exit 0; }
 
 # --- sign, notarize, package --------------------------------------------------
 # Developer ID signing + notarization, via Chromium's own signing tool (it
