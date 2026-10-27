@@ -53,12 +53,28 @@ mkdir -p "$out"
 } > "$out/args.gn"
 (cd "$H" && source ./dev.sh >/dev/null 2>&1; cd build/src && gn gen out/Release && autoninja -C out/Release chrome)
 
-# --- package -----------------------------------------------------------------
-app="$out/Biba.app"
-codesign --force --deep --sign - "$app"   # ad-hoc: no Apple Developer ID yet
+# --- sign, notarize, package --------------------------------------------------
+# Developer ID signing + notarization, via Chromium's own signing tool (it
+# knows the entitlements each helper app needs). The notary credentials are a
+# keychain profile created once with:
+#   xcrun notarytool store-credentials biba-notary --apple-id … --team-id 2U825JJT77
+identity=${BIBA_SIGN_IDENTITY:-"Developer ID Application: Vladislav Sergeev (2U825JJT77)"}
+notary_profile=${BIBA_NOTARY_PROFILE:-biba-notary}
+rm -rf "$out/signed"
+python3 "$out/Biba Packaging/sign_chrome.py" \
+  --input "$out" --output "$out/signed" \
+  --identity "$identity" \
+  --disable-packaging --notarize \
+  --notary-arg=--keychain-profile="$notary_profile"
+app=$(find "$out/signed" -maxdepth 3 -name 'Biba.app' -type d | head -1)
+[ -d "$app" ] || { echo "signed Biba.app not found" >&2; exit 1; }
+
 dmg="$dist/Biba-$version-$arch.dmg"
 rm -f "$dmg"
 hdiutil create -volname "Biba" -srcfolder "$app" -ov -format ULFO "$dmg" >/dev/null
+codesign --sign "$identity" --timestamp "$dmg"
+xcrun notarytool submit "$dmg" --keychain-profile "$notary_profile" --wait
+xcrun stapler staple "$dmg"
 
 # --- sign the update, write the appcast --------------------------------------
 sig=$("$sparkle/sign_update" "$dmg")   # sparkle:edSignature="…" length="…"
@@ -88,5 +104,5 @@ echo "Built $dmg"
 if [ "$publish" = "--publish" ]; then
   gh release create "v$version" "$dmg" "$dist/appcast-$arch.xml" \
     --repo "$repo" --title "Biba $version (beta)" \
-    --notes "Beta build for Macs with Apple Silicon. Biba is not notarized yet: the first time, right-click Biba in Applications and choose Open."
+    --notes "Beta build for Macs with Apple Silicon (macOS 12+). Signed and notarized. Biba updates itself from here."
 fi

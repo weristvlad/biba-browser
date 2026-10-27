@@ -1,0 +1,263 @@
+--- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
+@@ -420,7 +420,9 @@
+                     tabs::VerticalTabStripCollapseState::kCollapsed
+             ? 1
+             : std::min(
+-                  children_on_row,
++                  // Biba (Dia): at most three tiles per row, stretched; four
++                  // sit as a 2x2 square.
++                  children_on_row == 4 ? 2 : std::min(children_on_row, 3),
+                   static_cast<int>(std::floor((available_width - child_width) /
+                                               (child_width + kTabPadding)) +
+                                    1));
+--- a/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
+@@ -196,7 +196,18 @@
+   SetEventTargeter(std::make_unique<views::ViewTargeter>(this));
+ }
+ 
+-TabDragHandlerImpl::~TabDragHandlerImpl() = default;
++namespace {
++// Read by DraggedTabsContainer: while true, dragged views stay in their slot
++// as a ghost and the avatar does the moving.
++bool g_biba_avatar_active = false;
++}  // namespace
++
++TabDragHandlerImpl::~TabDragHandlerImpl() {
++  g_biba_avatar_active = false;
++  if (views::View* avatar = biba_avatar_.view(); avatar && avatar->parent()) {
++    avatar->parent()->RemoveChildViewT(avatar);
++  }
++}
+ 
+ bool TabDragHandlerImpl::DoesIntersectRect(const views::View* target,
+                                            const gfx::Rect& rect) const {
+@@ -782,14 +793,11 @@
+ }
+ 
+ void TabDragHandlerImpl::DestroyDragController() {
++  // Biba: however the drag ends, the floating avatar must not outlive it.
++  BibaLandAvatar();
+   drag_controller_.reset();
+ }
+ 
+-namespace {
+-// Read by DraggedTabsContainer: while true, dragged views stay in their slot
+-// as a ghost and the avatar does the moving.
+-bool g_biba_avatar_active = false;
+-}  // namespace
+ 
+ bool BibaDragAvatarActive() {
+   return g_biba_avatar_active;
+@@ -806,6 +814,11 @@
+ }
+ 
+ void TabDragHandlerImpl::BibaStartAvatar() {
++  // StartedDragging() runs again whenever the drag re-attaches (e.g. moving
++  // between the tiles and the list): keep the one avatar we have.
++  if (biba_avatar_.view()) {
++    return;
++  }
+   views::View* region = &tab_strip_region_view_.get();
+   if (std::string_view(region->GetClassName()) !=
+           "VerticalTabStripRegionView" ||
+@@ -863,6 +876,18 @@
+   if (!avatar || !avatar->parent()) {
+     return;
+   }
++  // Keep every real dragged view hidden: views get recreated (pin/unpin) and
++  // their layers reset while the drag runs, and each would flash for a frame.
++  if (drag_controller_) {
++    for (TabSlotView* slot_view :
++         drag_controller_->GetSessionData().attached_views()) {
++      if (IsLiveSlotView(slot_view)) {
++        if (views::View* view = ViewFromTabSlot(slot_view)) {
++          BibaHideDraggedView(view);
++        }
++      }
++    }
++  }
+   gfx::Point point = point_in_screen;
+   views::View::ConvertPointFromScreen(avatar->parent(), &point);
+   avatar->SetTile(point_in_screen.y() < BibaTileLine());
+@@ -979,6 +1004,9 @@
+     CHECK(dragged_view);
+     dragged_view->SetPaintToLayer();
+     dragged_view->layer()->SetFillsBoundsOpaquely(false);
++    if (BibaDragAvatarActive()) {
++      BibaHideDraggedView(dragged_view);
++    }
+     gfx::Vector2d offset = dragged_view->GetBoundsInScreen().origin() -
+                            source_view_origin_in_screen;
+     dragged_view->SetProperty(kOffsetAtTabDragStart, offset);
+@@ -1137,6 +1165,7 @@
+ }
+ 
+ void TabDragHandlerImpl::ResetDragState() {
++  BibaLandAvatar();
+   drag_controller_.reset();
+   scroll_synchronizers_.clear();
+ }
+--- a/chrome/browser/ui/views/tabs/common/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/common/BUILD.gn
+@@ -47,6 +47,7 @@
+ source_set("impl") {
+   sources = [
+     "dragged_tabs_container.cc",
++    "biba_tab_in_link.h",
+     "biba_drag_avatar.cc",
+     "biba_drag_avatar.h",
+     "horizontal_tab_style_views.cc",
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/common/biba_tab_in_link.h
+@@ -0,0 +1,14 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_COMMON_BIBA_TAB_IN_LINK_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_COMMON_BIBA_TAB_IN_LINK_H_
++
++#include "ui/base/class_property.h"
++
++// Biba (Dia): set on a TabView whose tab is shown by a pinned link row above
++// the divider; the tab list then leaves it out instead of showing it twice.
++extern const ui::ClassProperty<bool>* const kBibaTabInLinkKey;
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_COMMON_BIBA_TAB_IN_LINK_H_
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.h"
+ 
++#include "chrome/browser/ui/views/tabs/common/biba_tab_in_link.h"
++
+ #include <algorithm>
+ #include <vector>
+ 
+@@ -24,6 +26,8 @@
+ #include "ui/views/view.h"
+ #include "ui/views/view_utils.h"
+ 
++DEFINE_UI_CLASS_PROPERTY_KEY(bool, kBibaTabInLinkKey, false)
++
+ namespace {
+ constexpr int kTabVerticalPadding = 2;
+ }  // namespace
+@@ -355,7 +359,8 @@
+   int num_children = 0;
+   for (const auto* child :
+        tab_container_view->collection_node_->GetDirectChildren()) {
+-    bool should_show = true;
++    // Biba: tabs shown by a pinned link row take no room here.
++    bool should_show = !child->GetProperty(kBibaTabInLinkKey);
+     if (focused_group_id.has_value()) {
+       std::optional<tab_groups::TabGroupId> group_id =
+           GetGroupIdForChild(child);
+@@ -383,6 +388,10 @@
+   if (!CanBeVisible(child)) {
+     return false;
+   }
++  // Biba (Dia): a tab shown by a pinned link row isn't listed again.
++  if (child->GetProperty(kBibaTabInLinkKey)) {
++    return false;
++  }
+   auto drag_data = tab_container_view->GetVisualDataForDraggedView(*child);
+   if (drag_data && drag_data->should_hide) {
+     return false;
+--- a/chrome/browser/ui/views/tabs/vertical/biba_pinned_links_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/biba_pinned_links_view.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/views/tabs/vertical/biba_pinned_links_view.h"
+ 
+ #include <memory>
++#include <set>
+ #include <utility>
+ 
+ #include "base/functional/bind.h"
+@@ -14,6 +15,8 @@
+ #include "cc/paint/paint_flags.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/biba/biba_prefs.h"
++#include "chrome/browser/ui/views/tabs/common/tab_view.h"
++#include "chrome/browser/ui/views/tabs/common/biba_tab_in_link.h"
+ #include "chrome/browser/ui/browser_command_controller.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/layout_constants.h"
+@@ -41,6 +44,7 @@
+ #include "ui/views/controls/button/button.h"
+ #include "ui/views/controls/button/image_button.h"
+ #include "ui/views/controls/button/image_button_factory.h"
++#include "ui/views/view_utils.h"
+ 
+ namespace {
+ 
+@@ -262,6 +266,47 @@
+   SetVisible(!links_.empty());
+   PreferredSizeChanged();
+   SchedulePaint();
++  HideLinkedTabsFromList();
++}
++
++void BibaPinnedLinksView::HideLinkedTabsFromList() {
++  std::set<const tabs::TabInterface*> linked;
++  for (size_t i = 0; i < links_.size(); ++i) {
++    if (const tabs::TabInterface* tab = TabFor(i)) {
++      linked.insert(tab);
++    }
++  }
++  if (!parent()) {
++    return;
++  }
++  // Walk the tab strip (our parent) for tab views.
++  std::vector<views::View*> pending(parent()->children().begin(),
++                                    parent()->children().end());
++  while (!pending.empty()) {
++    views::View* view = pending.back();
++    pending.pop_back();
++    if (auto* tab_view = views::AsViewClass<TabView>(view)) {
++      const tabs::TabInterface* tab = tab_view->GetTabInterface();
++      const bool in_link = tab && !tab->IsPinned() && linked.contains(tab);
++      if (tab_view->GetProperty(kBibaTabInLinkKey) != in_link) {
++        tab_view->SetProperty(kBibaTabInLinkKey, in_link);
++        if (tab_view->parent()) {
++          tab_view->parent()->InvalidateLayout();
++        }
++      }
++      continue;
++    }
++    if (view == this) {
++      continue;
++    }
++    for (views::View* child : view->children()) {
++      pending.push_back(child);
++    }
++  }
++}
++
++void BibaPinnedLinksView::AddedToWidget() {
++  HideLinkedTabsFromList();
+ }
+ 
+ tabs::TabInterface* BibaPinnedLinksView::TabFor(size_t index) const {
+--- a/chrome/browser/ui/views/tabs/vertical/biba_pinned_links_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/biba_pinned_links_view.h
+@@ -43,6 +43,7 @@
+       const views::SizeBounds& available_size) const override;
+   void Layout(PassKey) override;
+   void OnPaint(gfx::Canvas* canvas) override;
++  void AddedToWidget() override;
+ 
+   // TabStripModelObserver:
+   void OnTabStripModelChanged(TabStripModel* tab_strip_model,
+@@ -60,6 +61,8 @@
+   class Row;
+ 
+   void Rebuild();
++  // Leaves tabs shown by a link row out of the tab list (Dia).
++  void HideLinkedTabsFromList();
+   void Open(size_t index);
+   void Remove(size_t index);
+   // The open tab showing link `index`, if any.

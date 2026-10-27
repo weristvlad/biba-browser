@@ -16,3 +16,8 @@ product_icon/16x16.png chrome/app/theme/default_100_percent/chromium/product_log
 product_icon/32x32.png chrome/app/theme/default_100_percent/chromium/product_logo_32.png
 product_icon/32x32.png chrome/app/theme/default_200_percent/chromium/product_logo_16.png
 product_icon/64x64.png chrome/app/theme/default_200_percent/chromium/product_logo_32.png
+
+# New tab and setup page favicons (were Helium's asterisk)
+product_icon/16x16.png chrome/app/theme/default_100_percent/common/favicon_ntp.png
+product_icon/32x32.png chrome/app/theme/default_200_percent/common/favicon_ntp.png
+product_icon/128x128.png components/helium_onboarding/public/favicon.png

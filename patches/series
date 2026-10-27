@@ -38,3 +38,8 @@ biba/drag-avatar.patch
 biba/sidebar-modes.patch
 biba/command-bar.patch
 biba/updates-github.patch
+biba/rebrand-helium.patch
+biba/pinned-links.patch
+biba/drag-ghost-and-tiles.patch
+biba/pinned-links-drag.patch
+biba/links-polish.patch

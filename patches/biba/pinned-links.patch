@@ -1,0 +1,875 @@
+--- a/chrome/browser/ui/biba/biba_prefs.h
++++ b/chrome/browser/ui/biba/biba_prefs.h
+@@ -18,6 +18,10 @@
+ inline constexpr char kSidebarShortcutHides[] =
+     "biba.appearance.sidebar_shortcut_hides";
+ 
++// Dictionary: pinned links per Space, {"<space index>": [{url, title}, ...]}
++// (Dia-style rows between the pinned tiles and the tabs).
++inline constexpr char kPinnedLinks[] = "biba.pinned_links";
++
+ // Boolean: the sidebar is hidden (Cmd+S); the page card spans the window.
+ inline constexpr char kSidebarHidden[] = "biba.sidebar_hidden";
+ 
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -146,6 +146,7 @@
+   registry->RegisterBooleanPref(biba::prefs::kMonochromeExtensionIcons, true);
+   registry->RegisterBooleanPref(biba::prefs::kSidebarShortcutHides, true);
+   registry->RegisterBooleanPref(biba::prefs::kSidebarHidden, false);
++  registry->RegisterDictionaryPref(biba::prefs::kPinnedLinks);
+ 
+   registry->RegisterBooleanPref(prefs::kHomePageIsNewTabPage, true,
+                                 pref_registration_flags);
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -515,6 +515,7 @@
+                                  u"New Space");
+     AddSubMenu(TabStripModel::CommandBibaMoveToSpace, u"Move to Space",
+                biba_space_submenu_.get());
++    AddItem(TabStripModel::CommandBibaPinLink, u"Pin link");
+   }
+ 
+   if (ExistingWindowSubMenuModel::ShouldShowSubmenu(tab_strip_->profile())) {
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -54,6 +54,10 @@
+ #include "chrome/browser/send_tab_to_self/send_tab_to_self_util.h"
+ #include "chrome/browser/ui/bookmarks/bookmark_utils.h"
+ #include "chrome/browser/ui/browser_command_controller.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/strings/string_number_conversions.h"
++#include "components/prefs/scoped_user_pref_update.h"
++#include "chrome/browser/ui/biba/biba_prefs.h"
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+@@ -2872,6 +2876,9 @@
+ 
+     case CommandBibaMoveToSpace:
+       return IndexOfFirstNonPinnedTab() <= context_index;
++
++    case CommandBibaPinLink:
++      return GetWebContentsAt(context_index) != nullptr;
+   }
+   SCOPED_CRASH_KEY_NUMBER("TabStripModel", "command_id", command_id);
+   NOTREACHED() << "Unsupported command: " << command_id;
+@@ -3322,6 +3329,35 @@
+     case CommandBibaMoveToSpace:
+       // Handled by the submenu's items.
+       break;
++
++    case CommandBibaPinLink: {
++      // Store the link for the active Space (BibaPinnedLinksView shows it).
++      WebContents* contents = GetWebContentsAt(context_index);
++      const GURL url = contents ? contents->GetLastCommittedURL() : GURL();
++      if (!url.is_valid()) {
++        break;
++      }
++      const int space = std::max(0, BibaActiveSpace());
++      ScopedDictPrefUpdate update(profile()->GetPrefs(),
++                                  biba::prefs::kPinnedLinks);
++      base::ListValue* list = update->EnsureList(base::NumberToString(space));
++      bool present = false;
++      for (const base::Value& item : *list) {
++        const std::string* existing =
++            item.is_dict() ? item.GetDict().FindString("url") : nullptr;
++        if (existing && GURL(*existing).host() == url.host() &&
++            GURL(*existing).path() == url.path()) {
++          present = true;
++        }
++      }
++      if (!present) {
++        base::DictValue link;
++        link.Set("url", url.spec());
++        link.Set("title", base::UTF16ToUTF8(contents->GetTitle()));
++        list->Append(std::move(link));
++      }
++      break;
++    }
+     case CommandToggleVertical: {
+       base::UmaHistogramCounts1000(
+           "Tab.ContextMenu.ToggleVertical.SelectedTabsCount",
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -55,6 +55,7 @@
+ #include "chrome/browser/ui/views/tabs/shared/drop_arrow.h"
+ #include "chrome/browser/ui/views/tabs/vertical/biba_space_preview_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.h"
++#include "chrome/browser/ui/views/tabs/vertical/biba_pinned_links_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/biba_space_switcher_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_focus_swipe_controller.h"
+@@ -889,6 +890,11 @@
+   view->SetProperty(views::kMarginsKey,
+                     gfx::Insets::TLBR(0, 0, kBottomContainerGap, 0));
+ 
++  // Biba (Dia): pinned links live inside the tab strip, between the pinned
++  // tiles and the tab list (placed by TabStripViewLayout).
++  view->AddChildView(
++      std::make_unique<BibaPinnedLinksView>(browser_view()->browser()));
++
+   views::View* const content_parent =
+       content_area_view_ ? content_area_view_.get() : this;
+   std::optional<size_t> bottom_container_index =
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_view_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_view_layout.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_view_layout.h"
+ 
++#include <string_view>
++
+ #include <algorithm>
+ 
+ #include "base/logging.h"
+@@ -286,6 +288,25 @@
+     }
+   }
+ 
++  // Biba (Dia): pinned links, then a divider, then the tabs.
++  for (views::View* child : tab_strip_view->children()) {
++    if (std::string_view(child->GetClassName()) != "BibaPinnedLinksView") {
++      continue;
++    }
++    const int links_height =
++        child->GetVisible()
++            ? child->GetPreferredSize(views::SizeBounds(size_bounds.width(), {}))
++                  .height()
++            : 0;
++    layouts.child_layouts.emplace_back(
++        child, child->GetVisible() && links_height > 0,
++        gfx::Rect(0, y, size_bounds.width().value(), links_height));
++    y += links_height;
++    if (size_bounds.height().is_bounded()) {
++      remaining_height = std::max(0, remaining_height - links_height);
++    }
++  }
++
+   // Place the unpinned container using the entire available width, we do not
+   // inset the x value by `region_horizontal_padding` here because, when the tab
+   // strip is collapsed, tab groups need to draw the group colored line in this
+--- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
+@@ -42,6 +42,8 @@
+ source_set("impl") {
+   sources = [
+     "biba_command_bar_view.cc",
++    "biba_pinned_links_view.cc",
++    "biba_pinned_links_view.h",
+     "biba_space_menu_button.cc",
+     "biba_space_preview_view.cc",
+     "biba_space_swipe_handler.cc",
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/biba_pinned_links_view.cc
+@@ -0,0 +1,369 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/vertical/biba_pinned_links_view.h"
++
++#include <memory>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/values.h"
++#include "cc/paint/paint_flags.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/biba/biba_prefs.h"
++#include "chrome/browser/ui/browser_command_controller.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/navigator/browser_navigator.h"
++#include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "components/favicon/content/content_favicon_driver.h"
++#include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
++#include "components/vector_icons/vector_icons.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/image_model.h"
++#include "ui/base/page_transition_types.h"
++#include "ui/base/window_open_disposition.h"
++#include "ui/color/color_id.h"
++#include "ui/color/color_provider.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/color_utils.h"
++#include "ui/gfx/font_list.h"
++#include "ui/gfx/geometry/rect_f.h"
++#include "ui/gfx/paint_vector_icon.h"
++#include "ui/gfx/scoped_canvas.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/controls/button/button.h"
++#include "ui/views/controls/button/image_button.h"
++#include "ui/views/controls/button/image_button_factory.h"
++
++namespace {
++
++constexpr int kRowPadding = 6;       // Sidebar side padding, like the tabs.
++constexpr int kIconSize = 16;
++constexpr int kIconInset = 9;
++constexpr int kTitleGap = 8;
++constexpr int kCornerRadius = 10;
++constexpr int kDividerGap = 8;       // Above and below the divider.
++
++int RowHeight() {
++  return GetLayoutConstant(LayoutConstant::kVerticalTabHeight);
++}
++
++std::string SpaceKey(int space) {
++  return base::NumberToString(space);
++}
++
++// Two URLs are the same link when they point at the same page.
++bool SameLink(const GURL& a, const GURL& b) {
++  return a.host() == b.host() && a.path() == b.path();
++}
++
++}  // namespace
++
++// One link row: favicon + title, a soft pill while its tab is active, an
++// unpin "x" on hover.
++class BibaPinnedLinksView::Row : public views::Button {
++  METADATA_HEADER(Row, views::Button)
++
++ public:
++  Row(BibaPinnedLinksView* owner, size_t index)
++      : views::Button(base::BindRepeating(&Row::Pressed,
++                                          base::Unretained(this))),
++        owner_(owner),
++        index_(index) {
++    remove_ = AddChildView(views::CreateVectorImageButtonWithNativeTheme(
++        base::BindRepeating(
++            [](BibaPinnedLinksView* owner, size_t index) {
++              owner->Remove(index);
++            },
++            owner, index),
++        vector_icons::kCloseChromeRefreshOldIcon, 14));
++    remove_->SetTooltipText(u"Unpin link");
++    remove_->SetVisible(false);
++  }
++
++  void SetState(std::u16string title, gfx::Image favicon, bool active) {
++    title_ = std::move(title);
++    favicon_ = std::move(favicon);
++    active_ = active;
++    GetViewAccessibility().SetName(title_);
++    SchedulePaint();
++  }
++
++  void Layout(PassKey) override {
++    const int size = 20;
++    remove_->SetBounds(width() - size - 8, (height() - size) / 2, size, size);
++  }
++
++  void OnMouseEntered(const ui::MouseEvent& event) override {
++    remove_->SetVisible(true);
++    views::Button::OnMouseEntered(event);
++    SchedulePaint();
++  }
++  void OnMouseExited(const ui::MouseEvent& event) override {
++    remove_->SetVisible(false);
++    views::Button::OnMouseExited(event);
++    SchedulePaint();
++  }
++
++  void PaintButtonContents(gfx::Canvas* canvas) override {
++    const ui::ColorProvider* colors = GetColorProvider();
++    const bool dark =
++        colors && color_utils::IsDark(colors->GetColor(ui::kColorSysSurface));
++    // Same veils as the tab rows (vertical_tab_style_views.cc).
++    float alpha = 0.0f;
++    if (active_) {
++      alpha = dark ? 0.14f : 0.85f;
++    } else if (IsMouseHovered()) {
++      alpha = dark ? 0.07f : 0.30f;
++    }
++    if (alpha > 0) {
++      cc::PaintFlags fill;
++      fill.setAntiAlias(true);
++      fill.setColor(SkColorSetA(SK_ColorWHITE,
++                                static_cast<U8CPU>(alpha * 255.0f)));
++      canvas->DrawRoundRect(gfx::RectF(GetLocalBounds()), kCornerRadius, fill);
++    }
++    const int icon_y = (height() - kIconSize) / 2;
++    if (!favicon_.IsEmpty()) {
++      canvas->DrawImageInt(*favicon_.ToImageSkia(), 0, 0, favicon_.Width(),
++                           favicon_.Height(), kIconInset, icon_y, kIconSize,
++                           kIconSize, /*filter=*/true);
++    } else if (colors) {
++      gfx::ScopedCanvas at_icon(canvas);
++      canvas->Translate(gfx::Vector2d(kIconInset, icon_y));
++      gfx::PaintVectorIcon(canvas, vector_icons::kGlobeIcon, kIconSize,
++                           colors->GetColor(ui::kColorIconSecondary));
++    }
++    const int text_x = kIconInset + kIconSize + kTitleGap;
++    const int text_right = remove_->GetVisible() ? remove_->x() - 4 : width() - 8;
++    canvas->DrawStringRectWithFlags(
++        title_, gfx::FontList().DeriveWithSizeDelta(1),
++        colors ? colors->GetColor(ui::kColorSysOnSurface) : SK_ColorBLACK,
++        gfx::Rect(text_x, 0, std::max(0, text_right - text_x), height()),
++        gfx::Canvas::NO_SUBPIXEL_RENDERING);
++  }
++
++ private:
++  void Pressed() { owner_->Open(index_); }
++
++  raw_ptr<BibaPinnedLinksView> owner_;
++  const size_t index_;
++  raw_ptr<views::ImageButton> remove_ = nullptr;
++  std::u16string title_;
++  gfx::Image favicon_;
++  bool active_ = false;
++};
++
++BEGIN_METADATA(BibaPinnedLinksView, Row)
++END_METADATA
++
++BibaPinnedLinksView::BibaPinnedLinksView(BrowserWindowInterface* browser)
++    : browser_(browser) {
++  prefs_.Init(browser_->GetProfile()->GetPrefs());
++  prefs_.Add(biba::prefs::kPinnedLinks,
++             base::BindRepeating(&BibaPinnedLinksView::Rebuild,
++                                 base::Unretained(this)));
++  if (auto* commands = chrome::BrowserCommandController::From(browser_)) {
++    space_changed_ = commands->BibaAddSpaceChangedCallback(base::BindRepeating(
++        [](BibaPinnedLinksView* self, int, int) { self->Rebuild(); },
++        base::Unretained(this)));
++  }
++  browser_->GetTabStripModel()->AddObserver(this);
++  Rebuild();
++}
++
++BibaPinnedLinksView::~BibaPinnedLinksView() {
++  if (browser_ && browser_->GetTabStripModel()) {
++    browser_->GetTabStripModel()->RemoveObserver(this);
++  }
++}
++
++// static
++void BibaPinnedLinksView::PinLink(BrowserWindowInterface* browser,
++                                  const GURL& url,
++                                  const std::u16string& title) {
++  if (!url.is_valid()) {
++    return;
++  }
++  const auto* commands = chrome::BrowserCommandController::From(browser);
++  const int space = commands ? commands->biba_active_space() : 0;
++  ScopedDictPrefUpdate update(browser->GetProfile()->GetPrefs(),
++                              biba::prefs::kPinnedLinks);
++  base::ListValue* list = update->EnsureList(SpaceKey(space));
++  for (const base::Value& item : *list) {
++    if (item.is_dict()) {
++      if (const std::string* existing = item.GetDict().FindString("url");
++          existing && SameLink(GURL(*existing), url)) {
++        return;
++      }
++    }
++  }
++  base::DictValue link;
++  link.Set("url", url.spec());
++  link.Set("title", base::UTF16ToUTF8(title));
++  list->Append(std::move(link));
++}
++
++int BibaPinnedLinksView::ActiveSpace() const {
++  const auto* commands = chrome::BrowserCommandController::From(browser_);
++  return commands ? commands->biba_active_space() : 0;
++}
++
++void BibaPinnedLinksView::Rebuild() {
++  links_.clear();
++  const base::DictValue& all =
++      browser_->GetProfile()->GetPrefs()->GetDict(biba::prefs::kPinnedLinks);
++  if (const base::ListValue* list = all.FindList(SpaceKey(ActiveSpace()))) {
++    for (const base::Value& item : *list) {
++      if (!item.is_dict()) {
++        continue;
++      }
++      const std::string* url = item.GetDict().FindString("url");
++      const std::string* title = item.GetDict().FindString("title");
++      GURL gurl(url ? *url : std::string());
++      if (gurl.is_valid()) {
++        links_.push_back(
++            {gurl, title ? base::UTF8ToUTF16(*title) : std::u16string()});
++      }
++    }
++  }
++  if (children().size() != links_.size()) {
++    RemoveAllChildViews();
++    for (size_t i = 0; i < links_.size(); ++i) {
++      AddChildView(std::make_unique<Row>(this, i));
++    }
++  }
++  const tabs::TabInterface* active =
++      browser_->GetTabStripModel()->GetActiveTab();
++  for (size_t i = 0; i < links_.size(); ++i) {
++    tabs::TabInterface* tab = TabFor(i);
++    content::WebContents* contents = tab ? tab->GetContents() : nullptr;
++    gfx::Image favicon;
++    if (contents) {
++      if (auto* driver =
++              favicon::ContentFaviconDriver::FromWebContents(contents)) {
++        favicon = driver->GetFavicon();
++      }
++    }
++    std::u16string title = links_[i].title;
++    if (title.empty()) {
++      title = base::UTF8ToUTF16(links_[i].url.host());
++    }
++    static_cast<Row*>(children()[i])
++        ->SetState(title, favicon, tab && tab == active);
++  }
++  SetVisible(!links_.empty());
++  PreferredSizeChanged();
++  SchedulePaint();
++}
++
++tabs::TabInterface* BibaPinnedLinksView::TabFor(size_t index) const {
++  const GURL& url = links_[index].url;
++  if (auto it = opened_.find(url.spec()); it != opened_.end()) {
++    if (tabs::TabInterface* tab = it->second.Get();
++        tab && browser_->GetTabStripModel()->GetIndexOfTab(tab) !=
++                   TabStripModel::kNoTab) {
++      return tab;
++    }
++  }
++  TabStripModel* model = browser_->GetTabStripModel();
++  for (int i = 0; i < model->count(); ++i) {
++    content::WebContents* contents = model->GetWebContentsAt(i);
++    if (contents && SameLink(contents->GetLastCommittedURL(), url)) {
++      return model->GetTabAtIndex(i);
++    }
++  }
++  return nullptr;
++}
++
++void BibaPinnedLinksView::Open(size_t index) {
++  if (index >= links_.size()) {
++    return;
++  }
++  TabStripModel* model = browser_->GetTabStripModel();
++  if (tabs::TabInterface* tab = TabFor(index)) {
++    model->ActivateTabAt(model->GetIndexOfTab(tab));
++    return;
++  }
++  NavigateParams params(browser_.get(), links_[index].url,
++                        ui::PAGE_TRANSITION_AUTO_BOOKMARK);
++  params.disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
++  Navigate(&params);
++  if (params.navigated_or_inserted_contents) {
++    if (tabs::TabInterface* tab = tabs::TabInterface::GetFromContents(
++            params.navigated_or_inserted_contents)) {
++      opened_[links_[index].url.spec()] = tab->GetHandle();
++    }
++  }
++}
++
++void BibaPinnedLinksView::Remove(size_t index) {
++  if (index >= links_.size()) {
++    return;
++  }
++  const GURL url = links_[index].url;
++  ScopedDictPrefUpdate update(browser_->GetProfile()->GetPrefs(),
++                              biba::prefs::kPinnedLinks);
++  if (base::ListValue* list = update->FindList(SpaceKey(ActiveSpace()))) {
++    list->EraseIf([&url](const base::Value& item) {
++      const std::string* existing =
++          item.is_dict() ? item.GetDict().FindString("url") : nullptr;
++      return existing && GURL(*existing) == url;
++    });
++  }
++  opened_.erase(url.spec());
++}
++
++gfx::Size BibaPinnedLinksView::CalculatePreferredSize(
++    const views::SizeBounds& available_size) const {
++  if (links_.empty()) {
++    return gfx::Size();
++  }
++  const int height = static_cast<int>(links_.size()) * RowHeight() +
++                     2 * kDividerGap + 1;
++  return gfx::Size(available_size.width().value_or(200), height);
++}
++
++void BibaPinnedLinksView::Layout(PassKey) {
++  int y = 0;
++  for (views::View* row : children()) {
++    row->SetBounds(kRowPadding, y, width() - 2 * kRowPadding, RowHeight());
++    y += RowHeight();
++  }
++}
++
++void BibaPinnedLinksView::OnPaint(gfx::Canvas* canvas) {
++  // The divider between the links and the tabs.
++  if (links_.empty()) {
++    return;
++  }
++  const ui::ColorProvider* colors = GetColorProvider();
++  const bool dark =
++      colors && color_utils::IsDark(colors->GetColor(ui::kColorSysSurface));
++  const int y = static_cast<int>(links_.size()) * RowHeight() + kDividerGap;
++  canvas->FillRect(gfx::Rect(kRowPadding + 8, y, width() - 2 * (kRowPadding + 8),
++                             1),
++                   SkColorSetA(dark ? SK_ColorWHITE : SK_ColorBLACK, 0x1F));
++}
++
++void BibaPinnedLinksView::OnTabStripModelChanged(
++    TabStripModel* tab_strip_model,
++    const TabStripModelChange& change,
++    const TabStripSelectionChange& selection) {
++  Rebuild();
++}
++
++void BibaPinnedLinksView::OnTabChangedAt(tabs::TabInterface* tab,
++                                         TabChangeType change_type) {
++  Rebuild();
++}
++
++BEGIN_METADATA(BibaPinnedLinksView)
++END_METADATA
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/biba_pinned_links_view.h
+@@ -0,0 +1,77 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_BIBA_PINNED_LINKS_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_BIBA_PINNED_LINKS_VIEW_H_
++
++#include <map>
++#include <string>
++#include <vector>
++
++#include "base/callback_list.h"
++#include "base/memory/raw_ptr.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "components/tabs/public/tab_interface.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "url/gurl.h"
++#include "ui/views/view.h"
++
++class BrowserWindowInterface;
++
++// Biba (Dia): pinned links. Rows between the pinned tiles and the tab list,
++// with a divider under them. A link stays in the sidebar when its tab is
++// closed; clicking it switches to its tab, or opens it again. Each Space has
++// its own links (pref biba::prefs::kPinnedLinks).
++class BibaPinnedLinksView : public views::View, public TabStripModelObserver {
++  METADATA_HEADER(BibaPinnedLinksView, views::View)
++
++ public:
++  explicit BibaPinnedLinksView(BrowserWindowInterface* browser);
++  BibaPinnedLinksView(const BibaPinnedLinksView&) = delete;
++  BibaPinnedLinksView& operator=(const BibaPinnedLinksView&) = delete;
++  ~BibaPinnedLinksView() override;
++
++  // Adds `url` to the active Space's links (no-op if it's already there).
++  static void PinLink(BrowserWindowInterface* browser,
++                      const GURL& url,
++                      const std::u16string& title);
++
++  // views::View:
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override;
++  void Layout(PassKey) override;
++  void OnPaint(gfx::Canvas* canvas) override;
++
++  // TabStripModelObserver:
++  void OnTabStripModelChanged(TabStripModel* tab_strip_model,
++                              const TabStripModelChange& change,
++                              const TabStripSelectionChange& selection) override;
++  void OnTabChangedAt(tabs::TabInterface* tab,
++                      TabChangeType change_type) override;
++
++  struct Link {
++    GURL url;
++    std::u16string title;
++  };
++
++ private:
++  class Row;
++
++  void Rebuild();
++  void Open(size_t index);
++  void Remove(size_t index);
++  // The open tab showing link `index`, if any.
++  tabs::TabInterface* TabFor(size_t index) const;
++  int ActiveSpace() const;
++
++  raw_ptr<BrowserWindowInterface> browser_;
++  std::vector<Link> links_;
++  // Tabs opened from a link stay tied to it even after they navigate.
++  std::map<std::string, tabs::TabHandle> opened_;
++  PrefChangeRegistrar prefs_;
++  base::CallbackListSubscription space_changed_;
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_BIBA_PINNED_LINKS_VIEW_H_
+--- a/components/tabs/public/tab_context_menu_command.h
++++ b/components/tabs/public/tab_context_menu_command.h
+@@ -44,6 +44,8 @@
+   CommandToggleTabMuted,
+   // Biba: "Move to Space" submenu.
+   CommandBibaMoveToSpace,
++  // Biba: "Pin link" (Dia-style pinned link row).
++  CommandBibaPinLink,
+ };
+ // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
+ 
+--- a/chrome/browser/ui/views/tabs/vertical/biba_command_bar_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/biba_command_bar_view.cc
+@@ -6,6 +6,13 @@
+ #include <string>
+ 
+ #include "chrome/browser/autocomplete/autocomplete_classifier_factory.h"
++#include <vector>
++#include "ui/views/controls/label.h"
++#include "components/omnibox/browser/autocomplete_result.h"
++#include "components/omnibox/browser/autocomplete_input.h"
++#include "components/omnibox/browser/autocomplete_controller.h"
++#include "chrome/browser/autocomplete/chrome_autocomplete_scheme_classifier.h"
++#include "chrome/browser/autocomplete/chrome_autocomplete_provider_client.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/biba/biba_command_bar.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+@@ -41,9 +48,66 @@
+ constexpr int kBarWidth = 640;
+ constexpr int kCornerRadius = 16;
+ 
++// One suggestion under the box: what it is, and where it goes.
++class SuggestionRow : public views::View {
++  METADATA_HEADER(SuggestionRow, views::View)
++
++ public:
++  SuggestionRow(const AutocompleteMatch& match, base::RepeatingClosure open)
++      : open_(std::move(open)) {
++    SetLayoutManager(std::make_unique<views::BoxLayout>(
++                         views::BoxLayout::Orientation::kHorizontal,
++                         gfx::Insets::VH(8, 12), 12))
++        ->set_cross_axis_alignment(
++            views::BoxLayout::CrossAxisAlignment::kCenter);
++    const bool search = AutocompleteMatch::IsSearchType(match.type);
++    AddChildView(std::make_unique<views::ImageView>(
++        ui::ImageModel::FromVectorIcon(
++            search ? vector_icons::kSearchIcon : vector_icons::kGlobeIcon,
++            ui::kColorIconSecondary, 16)));
++    auto* title = AddChildView(std::make_unique<views::Label>(
++        match.description.empty() || search ? match.contents
++                                            : match.description));
++    title->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++    title->SetFontList(gfx::FontList().DeriveWithSizeDelta(2));
++    title->SetElideBehavior(gfx::ELIDE_TAIL);
++    static_cast<views::BoxLayout*>(GetLayoutManager())
++        ->SetFlexForView(title, 1);
++    if (!search && !match.description.empty()) {
++      auto* url = AddChildView(std::make_unique<views::Label>(match.contents));
++      url->SetEnabledColor(ui::kColorLabelForegroundSecondary);
++      url->SetElideBehavior(gfx::ELIDE_TAIL);
++      url->SetMaximumWidthSingleLine(220);
++    }
++  }
++
++  void SetSelected(bool selected) {
++    if (selected == selected_) {
++      return;
++    }
++    selected_ = selected;
++    SetBackground(selected ? views::CreateRoundedRectBackground(
++                                 ui::kColorMenuItemBackgroundHighlighted, 10)
++                           : nullptr);
++  }
++
++  bool OnMousePressed(const ui::MouseEvent& event) override { return true; }
++  void OnMouseReleased(const ui::MouseEvent& event) override { open_.Run(); }
++
++ private:
++  base::RepeatingClosure open_;
++  bool selected_ = false;
++};
++
++BEGIN_METADATA(SuggestionRow)
++END_METADATA
++
++constexpr size_t kMaxSuggestions = 6;
++
+ class BibaCommandBarView : public views::View,
+                            public views::TextfieldController,
+-                           public views::WidgetObserver {
++                           public views::WidgetObserver,
++                           public AutocompleteController::Observer {
+   METADATA_HEADER(BibaCommandBarView, views::View)
+ 
+  public:
+@@ -51,17 +115,32 @@
+       : browser_(browser) {
+     SetBackground(views::CreateRoundedRectBackground(ui::kColorDialogBackground,
+                                                      kCornerRadius));
+-    SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(14, 18)));
++    SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(10, 10)));
+     SetLayoutManager(std::make_unique<views::BoxLayout>(
+-                         views::BoxLayout::Orientation::kHorizontal,
+-                         gfx::Insets(), 12))
++        views::BoxLayout::Orientation::kVertical, gfx::Insets(), 4));
++    auto* box = AddChildView(std::make_unique<views::View>());
++    box->SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(4, 8)));
++    box->SetLayoutManager(std::make_unique<views::BoxLayout>(
++                              views::BoxLayout::Orientation::kHorizontal,
++                              gfx::Insets(), 12))
+         ->set_cross_axis_alignment(
+             views::BoxLayout::CrossAxisAlignment::kCenter);
++    list_ = AddChildView(std::make_unique<views::View>());
++    list_->SetLayoutManager(std::make_unique<views::BoxLayout>(
++        views::BoxLayout::Orientation::kVertical));
++
++    autocomplete_ = std::make_unique<AutocompleteController>(
++        std::make_unique<ChromeAutocompleteProviderClient>(
++            browser->GetProfile()),
++        AutocompleteControllerConfig{
++            .provider_types =
++                AutocompleteClassifier::DefaultOmniboxProviders()});
++    autocomplete_->AddObserver(this);
+ 
+-    AddChildView(std::make_unique<views::ImageView>(
++    box->AddChildView(std::make_unique<views::ImageView>(
+         ui::ImageModel::FromVectorIcon(vector_icons::kSearchIcon,
+                                        ui::kColorIconSecondary, 20)));
+-    textfield_ = AddChildView(std::make_unique<views::Textfield>());
++    textfield_ = box->AddChildView(std::make_unique<views::Textfield>());
+     textfield_->SetPlaceholderText(u"Search or enter address");
+     textfield_->SetBorder(nullptr);
+     textfield_->SetBackground(nullptr);
+@@ -77,17 +156,61 @@
+   views::Textfield* textfield() { return textfield_; }
+ 
+   // views::TextfieldController:
++  void ContentsChanged(views::Textfield* sender,
++                       const std::u16string& new_contents) override {
++    if (new_contents.empty()) {
++      autocomplete_->Stop(AutocompleteStopReason::kClobbered);
++      ShowSuggestions({});
++      return;
++    }
++    AutocompleteInput input(
++        new_contents, metrics::OmniboxEventProto::OTHER,
++        ChromeAutocompleteSchemeClassifier(browser_->GetProfile()));
++    input.set_prevent_inline_autocomplete(true);
++    autocomplete_->Start(input);
++  }
++
++  // AutocompleteController::Observer:
++  void OnResultChanged(AutocompleteController* controller,
++                       bool default_match_changed) override {
++    std::vector<AutocompleteMatch> matches;
++    for (const AutocompleteMatch& match : controller->result()) {
++      if (matches.size() == kMaxSuggestions) {
++        break;
++      }
++      if (match.destination_url.is_valid()) {
++        matches.push_back(match);
++      }
++    }
++    ShowSuggestions(std::move(matches));
++  }
++
+   bool HandleKeyEvent(views::Textfield* sender,
+                       const ui::KeyEvent& key_event) override {
+     if (key_event.type() != ui::EventType::kKeyPressed) {
+       return false;
+     }
++    if (key_event.key_code() == ui::VKEY_DOWN ||
++        key_event.key_code() == ui::VKEY_UP) {
++      if (!matches_.empty()) {
++        const int n = static_cast<int>(matches_.size());
++        selected_ = (selected_ + (key_event.key_code() == ui::VKEY_DOWN ? 1
++                                                                       : -1) +
++                     n) % n;
++        UpdateSelection();
++      }
++      return true;
++    }
+     if (key_event.key_code() == ui::VKEY_ESCAPE) {
+       GetWidget()->Close();
+       return true;
+     }
+     if (key_event.key_code() == ui::VKEY_RETURN) {
+-      Open(std::u16string(sender->GetText()));
++      if (selected_ >= 0 && selected_ < static_cast<int>(matches_.size())) {
++        OpenUrl(matches_[selected_].destination_url);
++      } else {
++        Open(std::u16string(sender->GetText()));
++      }
+       return true;
+     }
+     return false;
+@@ -102,6 +225,46 @@
+   }
+ 
+  private:
++  void ShowSuggestions(std::vector<AutocompleteMatch> matches) {
++    matches_ = std::move(matches);
++    selected_ = matches_.empty() ? -1 : 0;
++    list_->RemoveAllChildViews();
++    for (size_t i = 0; i < matches_.size(); ++i) {
++      list_->AddChildView(std::make_unique<SuggestionRow>(
++          matches_[i],
++          base::BindRepeating(
++              [](BibaCommandBarView* self, size_t i) {
++                self->OpenUrl(self->matches_[i].destination_url);
++              },
++              base::Unretained(this), i)));
++    }
++    UpdateSelection();
++    if (views::Widget* widget = GetWidget()) {
++      // Grow downwards from the same top edge.
++      gfx::Rect bounds = widget->GetWindowBoundsInScreen();
++      bounds.set_height(GetPreferredSize().height());
++      widget->SetBounds(bounds);
++    }
++  }
++
++  void UpdateSelection() {
++    for (size_t i = 0; i < list_->children().size(); ++i) {
++      static_cast<SuggestionRow*>(list_->children()[i])
++          ->SetSelected(static_cast<int>(i) == selected_);
++    }
++  }
++
++  void OpenUrl(const GURL& url) {
++    if (!url.is_valid() || !browser_) {
++      return;
++    }
++    NavigateParams params(browser_.get(), url, ui::PAGE_TRANSITION_TYPED);
++    params.disposition = WindowOpenDisposition::CURRENT_TAB;
++    autocomplete_->RemoveObserver(this);
++    GetWidget()->Close();
++    Navigate(&params);
++  }
++
+   void Open(const std::u16string& text) {
+     if (text.empty() || !browser_) {
+       return;
+@@ -119,12 +282,17 @@
+     NavigateParams params(browser_.get(), match.destination_url,
+                           ui::PAGE_TRANSITION_TYPED);
+     params.disposition = WindowOpenDisposition::CURRENT_TAB;
++    autocomplete_->RemoveObserver(this);
+     GetWidget()->Close();
+     Navigate(&params);
+   }
+ 
+   raw_ptr<BrowserWindowInterface> browser_;
+   raw_ptr<views::Textfield> textfield_ = nullptr;
++  raw_ptr<views::View> list_ = nullptr;
++  std::unique_ptr<AutocompleteController> autocomplete_;
++  std::vector<AutocompleteMatch> matches_;
++  int selected_ = -1;
+ };
+ 
+ BEGIN_METADATA(BibaCommandBarView)

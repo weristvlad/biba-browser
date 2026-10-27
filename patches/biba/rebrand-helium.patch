@@ -1,0 +1,12 @@
+--- a/components/url_formatter/url_formatter.cc
++++ b/components/url_formatter/url_formatter.cc
+@@ -629,7 +629,8 @@
+     if (url.SchemeIs(content::kChromeUIScheme)) {
+       GURL url_;
+       GURL::Replacements replacements;
+-      replacements.SetSchemeStr(content::kHeliumUIScheme);
++      // Biba: show internal pages as biba:// (the fixer maps it back).
++      replacements.SetSchemeStr("biba");
+       url_ = url.ReplaceComponents(replacements);
+ 
+       return FormatUrlWithAdjustments(url_, format_types, unescape_rules,

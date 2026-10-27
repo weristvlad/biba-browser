@@ -1,0 +1,518 @@
+--- a/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
+@@ -6,6 +6,8 @@
+ 
+ #include <string_view>
+ 
++#include "chrome/browser/ui/views/tabs/common/biba_tab_in_link.h"
++
+ #include <memory>
+ #include <variant>
+ 
+@@ -433,9 +435,11 @@
+   if (std::string_view(GetClassName()) == "VerticalTabStripRegionView" &&
+       !drag_handler_->IsDraggingGroups()) {
+     UnpinnedTabContainerView* unpinned = GetUnpinnedTabsContainer();
++    const auto links = BibaPinnedLinksBoundsInScreen(this);
+     const int boundary =
+-        unpinned->GetBoundsInScreen().y() +
+-        GetLayoutConstant(LayoutConstant::kVerticalTabHeight) / 2;
++        links ? links->y()
++              : unpinned->GetBoundsInScreen().y() +
++                    GetLayoutConstant(LayoutConstant::kVerticalTabHeight) / 2;
+     if (point_in_screen.y() < boundary) {
+       return &GetPinnedTabsContainer()->GetTabDragTarget(point_in_screen);
+     }
+--- a/chrome/browser/ui/views/tabs/common/biba_tab_in_link.h
++++ b/chrome/browser/ui/views/tabs/common/biba_tab_in_link.h
+@@ -5,10 +5,41 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_TABS_COMMON_BIBA_TAB_IN_LINK_H_
+ #define CHROME_BROWSER_UI_VIEWS_TABS_COMMON_BIBA_TAB_IN_LINK_H_
+ 
++#include <optional>
++#include <string_view>
++#include <vector>
++
+ #include "ui/base/class_property.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/views/view.h"
++#include "ui/views/widget/widget.h"
+ 
+ // Biba (Dia): set on a TabView whose tab is shown by a pinned link row above
+ // the divider; the tab list then leaves it out instead of showing it twice.
+ extern const ui::ClassProperty<bool>* const kBibaTabInLinkKey;
+ 
++// The pinned links section of the sidebar in `any_view`'s window, in screen
++// coordinates, or nullopt if there is none. Dragging a tab above it makes a
++// pinned tile; dropping it on it makes a pinned link (Dia).
++inline std::optional<gfx::Rect> BibaPinnedLinksBoundsInScreen(
++    const views::View* any_view) {
++  const views::Widget* widget = any_view ? any_view->GetWidget() : nullptr;
++  if (!widget || !widget->GetRootView()) {
++    return std::nullopt;
++  }
++  std::vector<const views::View*> pending = {widget->GetRootView()};
++  while (!pending.empty()) {
++    const views::View* view = pending.back();
++    pending.pop_back();
++    if (std::string_view(view->GetClassName()) == "BibaPinnedLinksView") {
++      return view->GetVisible() ? std::optional(view->GetBoundsInScreen())
++                                : std::nullopt;
++    }
++    for (const views::View* child : view->children()) {
++      pending.push_back(child);
++    }
++  }
++  return std::nullopt;
++}
++
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_COMMON_BIBA_TAB_IN_LINK_H_
+--- a/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
+@@ -9,6 +9,7 @@
+ #include "ui/display/screen.h"
+ #include "components/favicon/content/content_favicon_driver.h"
+ #include "chrome/browser/ui/views/tabs/common/biba_drag_avatar.h"
++#include "chrome/browser/ui/views/tabs/common/biba_tab_in_link.h"
+ 
+ #include <algorithm>
+ #include <memory>
+@@ -809,6 +810,9 @@
+   if (!tab_strip_view || !tab_strip_view->unpinned_tabs_scroll_view()) {
+     return 0;
+   }
++  if (auto links = BibaPinnedLinksBoundsInScreen(tab_strip_view)) {
++    return links->y();
++  }
+   return tab_strip_view->unpinned_tabs_scroll_view()->GetBoundsInScreen().y() +
+          GetLayoutConstant(LayoutConstant::kVerticalTabHeight) / 2;
+ }
+@@ -896,53 +900,15 @@
+ 
+ void TabDragHandlerImpl::BibaLandAvatar() {
+   g_biba_avatar_active = false;
+-  auto* avatar = static_cast<BibaDragAvatar*>(biba_avatar_.view());
++  views::View* avatar = biba_avatar_.view();
+   biba_avatar_.SetView(nullptr);
+-  if (!avatar || !avatar->parent()) {
+-    return;
+-  }
+-  views::View* parent = avatar->parent();
+-  auto remove = base::BindOnce(
+-      [](std::unique_ptr<views::ViewTracker> tracker) {
+-        if (views::View* view = tracker->view(); view && view->parent()) {
+-          view->parent()->RemoveChildViewT(view);
+-        }
+-      },
+-      std::make_unique<views::ViewTracker>(avatar));
+-  // Land where the tab ended up.
+-  gfx::Rect target;
+-  bool tile = false;
+-  if (drag_controller_) {
+-    const DragSessionData& data = drag_controller_->GetSessionData();
+-    if (data.source_view_drag_data() && data.source_view_drag_data()->contents) {
+-      tabs::TabInterface* tab = tabs::TabInterface::GetFromContents(
+-          data.source_view_drag_data()->contents);
+-      TabCollectionNode* node =
+-          tab ? root_node_->GetNodeForHandle(tab->GetHandle()) : nullptr;
+-      if (node && node->view()) {
+-        biba_landing_view_.SetView(node->view());
+-        BibaHideDraggedView(node->view());
+-        target = node->view()->GetBoundsInScreen();
+-        gfx::Point origin = target.origin();
+-        views::View::ConvertPointFromScreen(parent, &origin);
+-        target.set_origin(origin);
+-        tile = tab->IsPinned();
+-      }
+-    }
++  if (avatar && avatar->parent()) {
++    avatar->parent()->RemoveChildViewT(avatar);
+   }
+-  if (target.IsEmpty()) {
+-    std::move(remove).Run();
+-    return;
++  if (views::View* landing = biba_landing_view_.view()) {
++    landing->DestroyLayer();
+   }
+-  // Reveal the real tab only once the avatar has landed on it.
+-  auto reveal = base::BindOnce(
+-      [](std::unique_ptr<views::ViewTracker> landing) {
+-        if (views::View* view = landing->view()) {
+-          view->DestroyLayer();
+-        }
+-      },
+-      std::make_unique<views::ViewTracker>(biba_landing_view_.view()));
+-  avatar->FlyTo(target, tile, std::move(remove).Then(std::move(reveal)));
++  biba_landing_view_.SetView(nullptr);
+ }
+ 
+ void TabDragHandlerImpl::StartedDragging(
+--- a/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
++++ b/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
+@@ -43,11 +43,16 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/tabs/common/biba_tab_in_link.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h"
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "chrome/browser/ui/browser_command_controller.h"
++#include "chrome/browser/profiles/profile.h"
++#include "base/strings/utf_string_conversions.h"
++#include "components/prefs/scoped_user_pref_update.h"
++#include "chrome/browser/ui/biba/biba_prefs.h"
+ #include "chrome/browser/ui/views/omnibox/omnibox_popup_presenter_base.h"
+ #include "chrome/browser/ui/views/tabs/dragging/drag_session_data.h"
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_context.h"
+@@ -126,6 +131,32 @@
+ 
+ namespace {
+ 
++// Biba: adds `contents`' page to the active Space's pinned links.
++void BibaPinTabAsLink(BrowserWindowInterface* browser,
++                      content::WebContents* contents) {
++  const GURL url = contents->GetLastCommittedURL();
++  if (!url.is_valid()) {
++    return;
++  }
++  const auto* commands = chrome::BrowserCommandController::From(browser);
++  const int space = commands ? std::max(0, commands->biba_active_space()) : 0;
++  ScopedDictPrefUpdate update(browser->GetProfile()->GetPrefs(),
++                              biba::prefs::kPinnedLinks);
++  base::ListValue* list = update->EnsureList(base::NumberToString(space));
++  for (const base::Value& item : *list) {
++    const std::string* existing =
++        item.is_dict() ? item.GetDict().FindString("url") : nullptr;
++    if (existing && GURL(*existing).host() == url.host() &&
++        GURL(*existing).path() == url.path()) {
++      return;
++    }
++  }
++  base::DictValue link;
++  link.Set("url", url.spec());
++  link.Set("title", base::UTF16ToUTF8(contents->GetTitle()));
++  list->Append(std::move(link));
++}
++
+ // Biba: Space dot under `point_in_screen` in `context`'s window, or -1.
+ int BibaSpaceAt(TabDragContext* context, const gfx::Point& point_in_screen) {
+   if (!context || !context->GetWidget()) {
+@@ -2110,11 +2141,23 @@
+           region ? region->GetUnpinnedTabsContainer() : nullptr;
+       // The dragged tab snaps to the top of the list as it rises, so count
+       // the upper half of the first row as "above" too.
++      const auto links = BibaPinnedLinksBoundsInScreen(region);
+       const int pin_line =
+-          unpinned ? unpinned->GetBoundsInScreen().y() +
+-                         GetLayoutConstant(LayoutConstant::kVerticalTabHeight) /
+-                             2
+-                   : 0;
++          links ? links->y()
++          : unpinned ? unpinned->GetBoundsInScreen().y() +
++                           GetLayoutConstant(LayoutConstant::kVerticalTabHeight) /
++                               2
++                     : 0;
++      // Dropped on the pinned links: the tab becomes a pinned link.
++      if (links && unpinned &&
++          links->Contains(gfx::Point(links->CenterPoint().x(),
++                                     last_point_in_screen_.y()))) {
++        for (const TabDragData& data : drag_data_.tab_drag_data_) {
++          if (data.contents && !data.pinned) {
++            BibaPinTabAsLink(browser_view->browser(), data.contents);
++          }
++        }
++      }
+       if (unpinned && unpinned->GetVisible() &&
+           last_point_in_screen_.y() < pin_line) {
+         std::vector<base::WeakPtr<content::WebContents>> to_pin;
+--- a/chrome/browser/ui/views/tabs/vertical/biba_pinned_links_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/biba_pinned_links_view.cc
+@@ -5,6 +5,8 @@
+ #include "chrome/browser/ui/views/tabs/vertical/biba_pinned_links_view.h"
+ 
+ #include <memory>
++#include <string_view>
++#include <algorithm>
+ #include <set>
+ #include <utility>
+ 
+@@ -15,6 +17,9 @@
+ #include "cc/paint/paint_flags.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/biba/biba_prefs.h"
++#include "ui/compositor/layer.h"
++#include "ui/views/view_class_properties.h"
++#include "chrome/browser/ui/views/tabs/common/biba_drag_avatar.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/biba_tab_in_link.h"
+ #include "chrome/browser/ui/browser_command_controller.h"
+@@ -154,8 +159,54 @@
+         gfx::Canvas::NO_SUBPIXEL_RENDERING);
+   }
+ 
++  // Drag a link: up onto the tiles to make it a tile, down into the list to
++  // unpin it, or within the links to reorder.
++  bool OnMousePressed(const ui::MouseEvent& event) override {
++    press_point_ = event.location();
++    dragging_ = false;
++    return views::Button::OnMousePressed(event);
++  }
++  bool OnMouseDragged(const ui::MouseEvent& event) override {
++    if (!dragging_ &&
++        (event.location() - press_point_).Length() >= 4) {
++      dragging_ = true;
++      owner_->StartRowDrag(index_, title_, favicon_, press_point_);
++    }
++    if (dragging_) {
++      gfx::Point screen = event.location();
++      views::View::ConvertPointToScreen(this, &screen);
++      owner_->UpdateRowDrag(screen);
++      return true;
++    }
++    return views::Button::OnMouseDragged(event);
++  }
++  void OnMouseReleased(const ui::MouseEvent& event) override {
++    if (dragging_) {
++      dragging_ = false;
++      gfx::Point screen = event.location();
++      views::View::ConvertPointToScreen(this, &screen);
++      owner_->EndRowDrag(index_, screen);
++      return;
++    }
++    views::Button::OnMouseReleased(event);
++  }
++  void OnMouseCaptureLost() override {
++    if (dragging_) {
++      dragging_ = false;
++      owner_->CancelRowDrag();
++    }
++    views::Button::OnMouseCaptureLost();
++  }
++
+  private:
+-  void Pressed() { owner_->Open(index_); }
++  void Pressed() {
++    if (!dragging_) {
++      owner_->Open(index_);
++    }
++  }
++
++  gfx::Point press_point_;
++  bool dragging_ = false;
+ 
+   raw_ptr<BibaPinnedLinksView> owner_;
+   const size_t index_;
+@@ -263,7 +314,8 @@
+     static_cast<Row*>(children()[i])
+         ->SetState(title, favicon, tab && tab == active);
+   }
+-  SetVisible(!links_.empty());
++  // Always present (just the divider when empty) so tabs can be dropped here.
++  SetVisible(true);
+   PreferredSizeChanged();
+   SchedulePaint();
+   HideLinkedTabsFromList();
+@@ -366,11 +418,114 @@
+   opened_.erase(url.spec());
+ }
+ 
++void BibaPinnedLinksView::StartRowDrag(size_t index,
++                                       const std::u16string& title,
++                                       const gfx::Image& favicon,
++                                       const gfx::Point& grab_in_row) {
++  views::View* host = this;
++  while (host->parent() &&
++         std::string_view(host->GetClassName()) !=
++             "VerticalTabStripRegionView") {
++    host = host->parent();
++  }
++  const int row_width = width() - 2 * kRowPadding;
++  const gfx::Size row(row_width, RowHeight());
++  const gfx::Size tile(
++      std::max(GetLayoutConstant(LayoutConstant::kVerticalTabPinnedHeight),
++               (row_width - 12) / 3),
++      GetLayoutConstant(LayoutConstant::kVerticalTabPinnedHeight));
++  auto* avatar = host->AddChildView(std::make_unique<BibaDragAvatar>(
++      favicon.IsEmpty() ? gfx::ImageSkia() : *favicon.ToImageSkia(), title,
++      row, tile, /*tile=*/false,
++      gfx::Vector2dF(row_width ? float(grab_in_row.x()) / row_width : 0.5f,
++                     float(grab_in_row.y()) / RowHeight())));
++  avatar->SetProperty(views::kViewIgnoredByLayoutKey, true);
++  drag_avatar_.SetView(avatar);
++  if (index < children().size() && children()[index]->layer() == nullptr) {
++    children()[index]->SetPaintToLayer();
++    children()[index]->layer()->SetFillsBoundsOpaquely(false);
++  }
++  if (index < children().size()) {
++    children()[index]->layer()->SetOpacity(0.0f);
++  }
++}
++
++void BibaPinnedLinksView::UpdateRowDrag(const gfx::Point& point_in_screen) {
++  auto* avatar = static_cast<BibaDragAvatar*>(drag_avatar_.view());
++  if (!avatar || !avatar->parent()) {
++    return;
++  }
++  gfx::Point point = point_in_screen;
++  views::View::ConvertPointFromScreen(avatar->parent(), &point);
++  avatar->SetTile(point_in_screen.y() < GetBoundsInScreen().y());
++  avatar->MoveTo(point);
++}
++
++void BibaPinnedLinksView::CancelRowDrag() {
++  if (views::View* avatar = drag_avatar_.view(); avatar && avatar->parent()) {
++    avatar->parent()->RemoveChildViewT(avatar);
++  }
++  drag_avatar_.SetView(nullptr);
++  for (views::View* row : children()) {
++    row->DestroyLayer();
++  }
++}
++
++void BibaPinnedLinksView::EndRowDrag(size_t index,
++                                     const gfx::Point& point_in_screen) {
++  CancelRowDrag();
++  if (index >= links_.size()) {
++    return;
++  }
++  const gfx::Rect bounds = GetBoundsInScreen();
++  const Link link = links_[index];
++  TabStripModel* model = browser_->GetTabStripModel();
++  if (point_in_screen.y() < bounds.y()) {
++    // Up onto the tiles: the link becomes a pinned tile.
++    tabs::TabInterface* tab = TabFor(index);
++    if (!tab) {
++      NavigateParams params(browser_.get(), link.url,
++                            ui::PAGE_TRANSITION_AUTO_BOOKMARK);
++      params.disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
++      Navigate(&params);
++      tab = params.navigated_or_inserted_contents
++                ? tabs::TabInterface::GetFromContents(
++                      params.navigated_or_inserted_contents)
++                : nullptr;
++    }
++    Remove(index);
++    if (tab) {
++      const int tab_index = model->GetIndexOfTab(tab);
++      if (tab_index != TabStripModel::kNoTab) {
++        model->SetTabPinned(tab_index, true);
++      }
++    }
++    return;
++  }
++  if (point_in_screen.y() >= bounds.bottom() - kDividerGap) {
++    // Down into the list: unpin; an open tab simply shows in the list again.
++    Remove(index);
++    return;
++  }
++  // Within the links: reorder.
++  const int target = std::clamp(
++      (point_in_screen.y() - bounds.y()) / std::max(1, RowHeight()), 0,
++      static_cast<int>(links_.size()) - 1);
++  if (static_cast<size_t>(target) == index) {
++    return;
++  }
++  ScopedDictPrefUpdate update(browser_->GetProfile()->GetPrefs(),
++                              biba::prefs::kPinnedLinks);
++  if (base::ListValue* list = update->FindList(SpaceKey(ActiveSpace()));
++      list && index < list->size()) {
++    base::Value moved = (*list)[index].Clone();
++    list->erase(list->begin() + index);
++    list->Insert(list->begin() + target, std::move(moved));
++  }
++}
++
+ gfx::Size BibaPinnedLinksView::CalculatePreferredSize(
+     const views::SizeBounds& available_size) const {
+-  if (links_.empty()) {
+-    return gfx::Size();
+-  }
+   const int height = static_cast<int>(links_.size()) * RowHeight() +
+                      2 * kDividerGap + 1;
+   return gfx::Size(available_size.width().value_or(200), height);
+@@ -386,9 +541,6 @@
+ 
+ void BibaPinnedLinksView::OnPaint(gfx::Canvas* canvas) {
+   // The divider between the links and the tabs.
+-  if (links_.empty()) {
+-    return;
+-  }
+   const ui::ColorProvider* colors = GetColorProvider();
+   const bool dark =
+       colors && color_utils::IsDark(colors->GetColor(ui::kColorSysSurface));
+--- a/chrome/browser/ui/views/tabs/vertical/biba_pinned_links_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/biba_pinned_links_view.h
+@@ -16,7 +16,9 @@
+ #include "components/prefs/pref_change_registrar.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "url/gurl.h"
++#include "ui/gfx/image/image.h"
+ #include "ui/views/view.h"
++#include "ui/views/view_tracker.h"
+ 
+ class BrowserWindowInterface;
+ 
+@@ -61,6 +63,14 @@
+   class Row;
+ 
+   void Rebuild();
++  // Dragging a link row (Row forwards its mouse events here).
++  void StartRowDrag(size_t index,
++                    const std::u16string& title,
++                    const gfx::Image& favicon,
++                    const gfx::Point& grab_in_row);
++  void UpdateRowDrag(const gfx::Point& point_in_screen);
++  void EndRowDrag(size_t index, const gfx::Point& point_in_screen);
++  void CancelRowDrag();
+   // Leaves tabs shown by a link row out of the tab list (Dia).
+   void HideLinkedTabsFromList();
+   void Open(size_t index);
+@@ -75,6 +85,7 @@
+   std::map<std::string, tabs::TabHandle> opened_;
+   PrefChangeRegistrar prefs_;
+   base::CallbackListSubscription space_changed_;
++  views::ViewTracker drag_avatar_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_BIBA_PINNED_LINKS_VIEW_H_
+--- a/components/helium_onboarding/src/app.css
++++ b/components/helium_onboarding/src/app.css
+@@ -1,3 +1,36 @@
++/* Biba palette over Helium Prism's (logo: peach #FFEFE9, pink #FFA1A1). */
++:root {
++    --primary: #3a1e2c;
++    --secondary: #6e5462;
++    --tertiary: #8f7684;
++    --helium-blue: #e46f78;
++    --helium-blue-hover: #ec7c85;
++    --helium-blue-press: #d6626b;
++    --bg-surface: #fffaf8;
++    --bg-gradient-start: #fff3ee;
++    --bg-gradient-end: #ffc2c2;
++    --intro-gradient-start: #ffe4dc;
++    --intro-gradient-end: #fff3ee;
++    --tooltip-bg: #ffe6e6;
++    --tooltip-shadow: color-mix(in srgb, #e4a3a8 50%, transparent);
++    --helium-elevated: #e46f78;
++}
++
++@media (prefers-color-scheme: dark) {
++    :root {
++        --primary: #fbe9ec;
++        --secondary: #c9aeb7;
++        --tertiary: #a88e99;
++        --tooltip-bg: #3a2030;
++        --bg-surface: #1e1219;
++        --bg-gradient-start: #24151e;
++        --bg-gradient-end: #5a2a3a;
++        --intro-gradient-start: var(--bg-gradient-start);
++        --intro-gradient-end: var(--bg-gradient-end);
++        --helium-elevated: #ffa1a1;
++    }
++}
++
+ :root {
+     --page-scroll-gradient-mask: linear-gradient(
+         to bottom,

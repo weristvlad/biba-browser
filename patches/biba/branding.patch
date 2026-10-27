@@ -19,7 +19,7 @@
 +MAC_BUNDLE_ID=com.weristvlad.biba
  MAC_CREATOR_CODE=Cr24
 -MAC_TEAM_ID=S4Q33XPHB4
-+MAC_TEAM_ID=0000000000
++MAC_TEAM_ID=2U825JJT77
 --- a/chrome/common/chrome_paths_mac.mm
 +++ b/chrome/common/chrome_paths_mac.mm
 @@ -32,7 +32,7 @@
