@@ -28,6 +28,7 @@ for a in "$@"; do
   esac
 done
 H=${BIBA_HELIUM:-/Volumes/BibaBuild/biba/helium-macos}
+repo_dir=$(cd "$(dirname "$0")/.." && pwd)
 src="$H/build/src"
 out="$src/out/Release"
 repo=weristvlad/biba-browser
@@ -79,6 +80,10 @@ fi
 #   xcrun notarytool store-credentials biba-notary --apple-id … --team-id 2U825JJT77
 identity=${BIBA_SIGN_IDENTITY:-"Developer ID Application: Vladislav Sergeev (2U825JJT77)"}
 notary_profile=${BIBA_NOTARY_PROFILE:-biba-notary}
+# The signing scripts ("Biba Packaging") are their own target, like in
+# Helium's build.sh.
+(cd "$H" && PATH="/opt/homebrew/opt/python@3.13/libexec/bin:$PATH" \
+  zsh -c 'source ./dev.sh >/dev/null 2>&1; _out_dir="$_src_dir/out/Release"; helium_build chrome/installer/mac')
 rm -rf "$out/signed"
 python3 "$out/Biba Packaging/sign_chrome.py" \
   --input "$out" --output "$out/signed" \
@@ -90,8 +95,17 @@ app=$(find "$out/signed" -maxdepth 3 -name 'Biba.app' -type d | head -1)
 
 dmg="$dist/Biba-$version-$arch.dmg"
 rm -f "$dmg"
-hdiutil create -volname "Biba" -srcfolder "$app" -ov -format ULFO "$dmg" >/dev/null
-codesign --sign "$identity" --timestamp "$dmg"
+# Same DMG layout as Helium's sign_and_package_app.sh (drag to Applications).
+(cd "$src" && chrome/installer/mac/pkg-dmg \
+  --sourcefile --source "$app" \
+  --target "$dmg" \
+  --volname Biba --format ULMO \
+  --icon "$app/Contents/Resources/app.icns" \
+  --symlink /Applications:/Applications \
+  --mkdir .background \
+  --copy "$repo_dir/resources/dmg_background.png:/.background/dmg_background.png" \
+  --copy "$H/resources/dmg_dsstore:/.DS_Store")
+codesign --sign "$identity" --identifier com.weristvlad.biba --timestamp --force "$dmg"
 xcrun notarytool submit "$dmg" --keychain-profile "$notary_profile" --wait
 xcrun stapler staple "$dmg"
 
