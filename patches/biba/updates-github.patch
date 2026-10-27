@@ -1,0 +1,19 @@
+--- a/components/helium_services/helium_services_helpers.cc
++++ b/components/helium_services/helium_services_helpers.cc
+@@ -28,10 +28,14 @@
+ #endif
+ 
+ #if defined(UPDATES_SUPPORTED)
+-constexpr std::string_view kUpdateBaseUrl = "https://updates.helium.computer/";
++// Biba: updates come from Biba's GitHub releases; every release carries the
++// Sparkle appcast for each architecture, and "latest/download" always points
++// at the newest one.
++constexpr std::string_view kUpdateBaseUrl =
++    "https://github.com/weristvlad/biba-browser/releases/latest/download/";
+ constexpr const char kUpdatePath[] =
+ #if BUILDFLAG(IS_MAC)
+-    "mac/appcast-" CPU_ARCH_STR ".xml";
++    "appcast-" CPU_ARCH_STR ".xml";
+ #elif BUILDFLAG(IS_WIN)
+     "win/appcast.xml";
+ #endif

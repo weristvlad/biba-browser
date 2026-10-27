@@ -1,0 +1,332 @@
+--- a/chrome/browser/ui/biba/biba_spaces_controller.cc
++++ b/chrome/browser/ui/biba/biba_spaces_controller.cc
+@@ -5,6 +5,13 @@
+ #include "chrome/browser/ui/biba/biba_spaces_controller.h"
+ 
+ #include <utility>
++#include "chrome/browser/profiles/profile.h"
++#include "base/values.h"
++#include "base/no_destructor.h"
++#include "base/json/json_writer.h"
++#include "base/json/json_reader.h"
++#include "base/files/important_file_writer.h"
++#include <set>
+ 
+ #include "base/check_op.h"
+ #include "base/logging.h"
+@@ -40,15 +47,177 @@
+     default;
+ BibaSpacesController::Space::~Space() = default;
+ 
++namespace {
++
++// Profiles whose Spaces file is owned by a window. Only the first window of a
++// profile persists its Spaces, so windows don't overwrite each other.
++std::set<base::FilePath>& PersistingProfiles() {
++  static base::NoDestructor<std::set<base::FilePath>> profiles;
++  return *profiles;
++}
++
++constexpr char kStateFile[] = "Biba Spaces.json";
++
++}  // namespace
++
+ BibaSpacesController::BibaSpacesController(TabStripModel* tab_strip_model)
+-    : tab_strip_model_(tab_strip_model) {}
++    : tab_strip_model_(tab_strip_model) {
++  LoadState();
++}
+ 
+-BibaSpacesController::~BibaSpacesController() = default;
++BibaSpacesController::~BibaSpacesController() {
++  if (!state_path_.empty()) {
++    PersistingProfiles().erase(state_path_);
++  }
++}
++
++void BibaSpacesController::LoadState() {
++  Profile* profile = tab_strip_model_->profile();
++  if (!profile || profile->IsOffTheRecord()) {
++    return;
++  }
++  const base::FilePath path = profile->GetPath().AppendASCII(kStateFile);
++  if (!PersistingProfiles().insert(path).second) {
++    return;
++  }
++  state_path_ = path;
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(
++          [](base::FilePath path) -> std::optional<std::string> {
++            std::string json;
++            if (!base::ReadFileToString(path, &json)) {
++              return std::nullopt;
++            }
++            return json;
++          },
++          path),
++      base::BindOnce(&BibaSpacesController::OnStateLoaded,
++                     weak_factory_.GetWeakPtr()));
++}
++
++void BibaSpacesController::OnStateLoaded(std::optional<std::string> json) {
++  // The user got there first; their choice wins over the saved state.
++  if (!json || switched_) {
++    return;
++  }
++  std::optional<base::Value> value =
++      base::JSONReader::Read(*json, base::JSON_PARSE_RFC);
++  if (!value || !value->is_dict()) {
++    return;
++  }
++  const base::Value::Dict& dict = value->GetDict();
++  const int active = dict.FindInt("active").value_or(0);
++  if (active < 0 || active >= kMaxSpaces) {
++    return;
++  }
++  if (const base::Value::List* spaces = dict.FindList("spaces")) {
++    for (size_t i = 0; i < spaces->size() && i < kMaxSpaces; ++i) {
++      if (static_cast<int>(i) == active || !(*spaces)[i].is_list()) {
++        continue;
++      }
++      for (const base::Value& tab : (*spaces)[i].GetList()) {
++        if (!tab.is_dict()) {
++          continue;
++        }
++        const std::string* url = tab.GetDict().FindString("url");
++        const std::string* title = tab.GetDict().FindString("title");
++        GURL gurl(url ? *url : std::string());
++        if (gurl.is_valid()) {
++          saved_[i].push_back(
++              {gurl, title ? base::UTF8ToUTF16(*title) : std::u16string()});
++        }
++      }
++    }
++  }
++  active_space_ = active;
++  if (on_space_changed_) {
++    on_space_changed_.Run();
++  }
++}
++
++void BibaSpacesController::SaveState() {
++  if (state_path_.empty()) {
++    return;
++  }
++  auto tab_value = [](const GURL& url, const std::u16string& title) {
++    base::Value::Dict tab;
++    tab.Set("url", url.spec());
++    tab.Set("title", base::UTF16ToUTF8(title));
++    return tab;
++  };
++  base::Value::List spaces;
++  for (int i = 0; i < kMaxSpaces; ++i) {
++    base::Value::List tabs;
++    if (i != active_space_) {
++      for (const SavedTab& saved : saved_[i]) {
++        tabs.Append(tab_value(saved.url, saved.title));
++      }
++      for (const tabs::TabInterface* tab : ParkedTabs(i)) {
++        content::WebContents* contents = tab->GetContents();
++        if (contents && contents->GetLastCommittedURL().is_valid()) {
++          tabs.Append(tab_value(contents->GetLastCommittedURL(),
++                                contents->GetTitle()));
++        }
++      }
++    }
++    spaces.Append(std::move(tabs));
++  }
++  base::Value::Dict state;
++  state.Set("version", 1);
++  state.Set("active", active_space_);
++  state.Set("spaces", std::move(spaces));
++  std::optional<std::string> json = base::WriteJsonWithOptions(
++      state, base::JSONWriter::OPTIONS_PRETTY_PRINT);
++  if (!json) {
++    return;
++  }
++  base::ThreadPool::PostTask(
++      FROM_HERE,
++      {base::MayBlock(), base::TaskPriority::BEST_EFFORT,
++       base::TaskShutdownBehavior::BLOCK_SHUTDOWN},
++      base::BindOnce(
++          [](base::FilePath path, std::string json) {
++            base::ImportantFileWriter::WriteFileAtomically(path, json);
++          },
++          state_path_, std::move(*json)));
++}
++
++void BibaSpacesController::OpenSavedTabs(int index) {
++  std::vector<SavedTab> saved = std::move(saved_[index]);
++  saved_[index].clear();
++  TabStripModel* model = tab_strip_model_.get();
++  for (const SavedTab& tab : saved) {
++    model->delegate()->AddTabAt(tab.url, -1, /*foreground=*/false);
++  }
++}
++
++std::vector<const tabs::TabInterface*> BibaSpacesController::ParkedTabs(
++    int index) const {
++  std::vector<const tabs::TabInterface*> result;
++  for (const DetachedItem& item : spaces_[index].items) {
++    if (const auto* tab = std::get_if<std::unique_ptr<DetachedTab>>(&item)) {
++      result.push_back((*tab)->tab.get());
++    } else if (const auto* collection =
++                   std::get_if<std::unique_ptr<DetachedTabCollection>>(
++                       &item)) {
++      std::visit(
++          [&result](const auto& c) {
++            for (const tabs::TabInterface* t : c->GetTabsRecursive()) {
++              result.push_back(t);
++            }
++          },
++          (*collection)->collection_);
++    }
++  }
++  return result;
++}
+ 
+ void BibaSpacesController::SwitchToSpace(int index) {
+   if (index < 0 || index >= kMaxSpaces || index == active_space_) {
+     return;
+   }
++  switched_ = true;
+ 
+   TabStripModel* model = tab_strip_model_.get();
+   Space& current = spaces_[active_space_];
+@@ -71,6 +240,12 @@
+   // that becomes empty closes its window. Appending keeps the indices in
+   // `outgoing` valid.
+   tabs::TabInterface* to_activate = AttachSpace(target);
++  if (!saved_[index].empty()) {
++    OpenSavedTabs(index);
++    if (!to_activate && model->count() > old_count) {
++      to_activate = model->GetTabAtIndex(old_count);
++    }
++  }
+   if (model->count() == old_count) {
+     // Fresh Space (or one whose tabs were all closed): start with a new tab.
+     model->delegate()->AddTabAt(GURL(), -1, /*foreground=*/true);
+@@ -89,6 +264,7 @@
+   }
+   current.items = model->DetachTabsAndCollectionsForInsertion(outgoing);
+   active_space_ = index;
++  SaveState();
+   if (on_space_changed_) {
+     on_space_changed_.Run();
+   }
+@@ -100,10 +276,10 @@
+   if (index < 0 || index >= kMaxSpaces || index == active_space_) {
+     return preview;
+   }
+-  auto add = [&preview](const tabs::TabInterface* tab) {
++  for (const tabs::TabInterface* tab : ParkedTabs(index)) {
+     content::WebContents* contents = tab ? tab->GetContents() : nullptr;
+     if (!contents) {
+-      return;
++      continue;
+     }
+     PreviewItem item;
+     item.title = contents->GetTitle();
+@@ -112,21 +288,11 @@
+       item.favicon = driver->GetFavicon();
+     }
+     preview.push_back(std::move(item));
+-  };
+-  for (const DetachedItem& item : spaces_[index].items) {
+-    if (const auto* tab = std::get_if<std::unique_ptr<DetachedTab>>(&item)) {
+-      add((*tab)->tab.get());
+-    } else if (const auto* collection =
+-                   std::get_if<std::unique_ptr<DetachedTabCollection>>(
+-                       &item)) {
+-      std::visit(
+-          [&add](const auto& c) {
+-            for (const tabs::TabInterface* t : c->GetTabsRecursive()) {
+-              add(t);
+-            }
+-          },
+-          (*collection)->collection_);
+-    }
++  }
++  for (const SavedTab& saved : saved_[index]) {
++    preview.push_back({saved.title.empty() ? base::UTF8ToUTF16(saved.url.host())
++                                           : saved.title,
++                       gfx::Image()});
+   }
+   return preview;
+ }
+--- a/chrome/browser/ui/biba/biba_spaces_controller.h
++++ b/chrome/browser/ui/biba/biba_spaces_controller.h
+@@ -10,10 +10,12 @@
+ #include <variant>
+ #include <vector>
+ 
++#include <optional>
+ #include <string>
+ 
+ #include "base/memory/raw_ptr.h"
+ #include "ui/gfx/image/image.h"
++#include "url/gurl.h"
+ #include "base/files/file_path.h"
+ #include "base/functional/callback.h"
+ #include "base/memory/weak_ptr.h"
+@@ -57,7 +59,8 @@
+   // True for the visible Space and for Spaces that hold parked tabs.
+   bool IsSpaceInUse(int index) const {
+     return index == active_space_ ||
+-           (index >= 0 && index < kMaxSpaces && !spaces_[index].items.empty());
++           (index >= 0 && index < kMaxSpaces &&
++            (!spaces_[index].items.empty() || !saved_[index].empty()));
+   }
+ 
+   // Called after the visible Space changed (e.g. to repaint the frame).
+@@ -76,6 +79,23 @@
+                    const base::FilePath& shots_dir);
+ 
+  private:
++  // A tab of a Space saved by a previous session, not yet re-opened.
++  struct SavedTab {
++    GURL url;
++    std::u16string title;
++  };
++
++  // Persistence (biba/spaces-persist.patch). The active Space's tabs are
++  // restored by the regular session restore; parked Spaces are written to
++  // "<profile>/Biba Spaces.json" whenever the Space changes and re-opened
++  // lazily the first time each Space is visited.
++  void LoadState();
++  void OnStateLoaded(std::optional<std::string> json);
++  void SaveState();
++  void OpenSavedTabs(int index);
++  // Tabs of parked Space `index`, flattened in strip order.
++  std::vector<const tabs::TabInterface*> ParkedTabs(int index) const;
++
+   using DetachedItem = std::variant<std::unique_ptr<DetachedTab>,
+                                     std::unique_ptr<DetachedTabCollection>>;
+ 
+@@ -104,6 +124,9 @@
+   std::array<Space, kMaxSpaces> spaces_;
+   int active_space_ = 0;
+   base::RepeatingClosure on_space_changed_;
++  std::array<std::vector<SavedTab>, kMaxSpaces> saved_;
++  base::FilePath state_path_;
++  bool switched_ = false;
+ 
+   void SelfTestStep(int step);
+   void LogStrip(const char* label);
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -366,6 +366,13 @@
+     biba_spaces_->RunSelfTest(
+         browser_, base::CommandLine::ForCurrentProcess()->GetSwitchValuePath(
+                       "biba-spaces-selftest"));
++  } else if (browser_->GetType() == BrowserWindowInterface::TYPE_NORMAL) {
++    // Created up front so saved Spaces come back with the window.
++    biba_spaces_ =
++        std::make_unique<BibaSpacesController>(browser_->GetTabStripModel());
++    biba_spaces_->set_on_space_changed(
++        base::BindRepeating(&BrowserCommandController::RepaintBibaFrame,
++                            base::Unretained(this)));
+   }
+   PrefService* local_state = g_browser_process->local_state();
+   if (local_state) {

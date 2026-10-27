@@ -1,0 +1,254 @@
+--- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
+@@ -59,6 +59,7 @@
+     "//chrome/app:command_ids",
+     "//chrome/browser/ui:browser_command_controller",
+     "//chrome/browser/ui/views/frame:biba_frame_paint",
++    "//components/viz/common",
+     "//ui/compositor",
+     "//ui/menus",
+     "//ui/events",
+--- a/chrome/browser/ui/views/tabs/vertical/biba_space_preview_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_preview_view.cc
+@@ -8,6 +8,7 @@
+ #include "ui/color/color_id.h"
+ #include "ui/color/color_provider.h"
+ #include "ui/gfx/canvas.h"
++#include "ui/gfx/scoped_canvas.h"
+ #include "ui/gfx/font_list.h"
+ #include "ui/gfx/image/image_skia.h"
+ #include "ui/gfx/text_constants.h"
+@@ -34,6 +35,7 @@
+                                     int row_pitch,
+                                     int row_height) {
+   items_ = std::move(items);
++  snapshot_ = gfx::ImageSkia();
+   first_row_y_ = first_row_y;
+   row_x_ = row_x;
+   row_pitch_ = row_pitch;
+@@ -41,7 +43,20 @@
+   SchedulePaint();
+ }
+ 
++void BibaSpacePreviewView::SetSnapshot(const gfx::ImageSkia& snapshot,
++                                       int clip_height) {
++  snapshot_ = snapshot;
++  snapshot_clip_height_ = clip_height;
++  SchedulePaint();
++}
++
+ void BibaSpacePreviewView::OnPaint(gfx::Canvas* canvas) {
++  if (!snapshot_.isNull()) {
++    gfx::ScopedCanvas scoped(canvas);
++    canvas->ClipRect(gfx::Rect(0, 0, width(), snapshot_clip_height_));
++    canvas->DrawImageInt(snapshot_, 0, 0);
++    return;
++  }
+   const SkColor text_color =
+       GetColorProvider()->GetColor(ui::kColorSysOnSurface);
+   const gfx::FontList font_list;
+--- a/chrome/browser/ui/views/tabs/vertical/biba_space_preview_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_preview_view.h
+@@ -11,6 +11,7 @@
+ 
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/gfx/image/image.h"
++#include "ui/gfx/image/image_skia.h"
+ #include "ui/views/view.h"
+ 
+ // Lightweight drawing of a parked Space's tab list (favicon + title rows),
+@@ -31,11 +32,17 @@
+   void SetItems(Items items, int first_row_y, int row_x, int row_pitch,
+                 int row_height);
+ 
++  // A pixel snapshot of the Space's real tab list (preferred over `items`).
++  // Only the top `clip_height` DIPs are drawn (keeps the dots out).
++  void SetSnapshot(const gfx::ImageSkia& snapshot, int clip_height);
++
+   // views::View:
+   void OnPaint(gfx::Canvas* canvas) override;
+ 
+  private:
+   Items items_;
++  gfx::ImageSkia snapshot_;
++  int snapshot_clip_height_ = 0;
+   // Geometry copied from the real tab list so rows line up.
+   int first_row_y_ = 0;
+   int row_x_ = 0;
+--- a/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.cc
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.cc
+@@ -9,6 +9,12 @@
+ #include <string_view>
+ 
+ #include "base/functional/bind.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "components/viz/common/frame_sinks/copy_output_request.h"
++#include "components/viz/common/frame_sinks/copy_output_result.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "ui/gfx/image/image_skia_rep.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/ui/browser_command_controller.h"
+ #include "chrome/browser/ui/views/tabs/vertical/biba_space_preview_view.h"
+@@ -69,9 +75,75 @@
+         base::BindRepeating(&BibaSpaceSwipeHandler::OnSpaceChanged,
+                             base::Unretained(this)));
+   }
++  if (browser_ && browser_->GetTabStripModel()) {
++    browser_->GetTabStripModel()->AddObserver(this);
++  }
++}
++
++BibaSpaceSwipeHandler::~BibaSpaceSwipeHandler() {
++  if (browser_ && browser_->GetTabStripModel()) {
++    browser_->GetTabStripModel()->RemoveObserver(this);
++  }
++}
++
++void BibaSpaceSwipeHandler::OnTabStripModelChanged(
++    TabStripModel* tab_strip_model,
++    const TabStripModelChange& change,
++    const TabStripSelectionChange& selection) {
++  ScheduleSnapshot(base::Milliseconds(500));
+ }
+ 
+-BibaSpaceSwipeHandler::~BibaSpaceSwipeHandler() = default;
++void BibaSpaceSwipeHandler::OnTabChangedAt(tabs::TabInterface* tab,
++                                           TabChangeType change_type) {
++  ScheduleSnapshot(base::Milliseconds(500));
++}
++
++void BibaSpaceSwipeHandler::ScheduleSnapshot(base::TimeDelta delay) {
++  snapshot_timer_.Start(FROM_HERE, delay,
++                        base::BindOnce(&BibaSpaceSwipeHandler::CaptureSnapshot,
++                                       base::Unretained(this)));
++}
++
++int BibaSpaceSwipeHandler::SnapshotClipHeight() const {
++  int clip = sidebar_->height();
++  for (const views::View* child : sidebar_->children()) {
++    if (std::string_view(child->GetClassName()) == "BibaSpaceSwitcherView") {
++      clip = child->y();
++    }
++  }
++  return clip;
++}
++
++void BibaSpaceSwipeHandler::CaptureSnapshot() {
++  ui::Layer* layer = sidebar_ ? sidebar_->layer() : nullptr;
++  // Only a list at rest is a faithful picture of the Space.
++  if (!layer || tracking_ || offset_ != 0.0f ||
++      (preview_ && preview_->GetVisible()) || sidebar_->bounds().IsEmpty()) {
++    return;
++  }
++  const auto* commands = chrome::BrowserCommandController::From(browser_);
++  const int space = commands ? commands->biba_active_space() : 0;
++  const float scale = layer->device_scale_factor();
++  auto request = std::make_unique<viz::CopyOutputRequest>(
++      viz::CopyOutputRequest::ResultFormat::RGBA,
++      viz::CopyOutputRequest::ResultDestination::kSystemMemory,
++      base::BindOnce(
++          [](base::WeakPtr<BibaSpaceSwipeHandler> self, int space, float scale,
++             std::unique_ptr<viz::CopyOutputResult> result) {
++            if (!self || result->IsEmpty()) {
++              return;
++            }
++            auto scoped = result->ScopedAccessSkBitmap();
++            SkBitmap bitmap = scoped.GetOutScopedBitmap();
++            if (bitmap.drawsNothing()) {
++              return;
++            }
++            self->snapshots_[space] =
++                gfx::ImageSkia(gfx::ImageSkiaRep(bitmap, scale));
++          },
++          weak_factory_.GetWeakPtr(), space, scale));
++  layer->RequestCopyOfOutput(std::move(request));
++}
+ 
+ int BibaSpaceSwipeHandler::NeighbourSpace(int direction) const {
+   const auto* commands = chrome::BrowserCommandController::From(browser_);
+@@ -153,6 +225,10 @@
+     preview_->SetBoundsRect(sidebar_->GetLocalBounds());
+     preview_->SetItems(std::move(items), first.y(), first.x(), pitch,
+                        first.height());
++    // Prefer the real thing: a snapshot of the Space's actual tab list.
++    if (auto it = snapshots_.find(space); it != snapshots_.end()) {
++      preview_->SetSnapshot(it->second, SnapshotClipHeight());
++    }
+   }
+   if (!preview_->layer()) {
+     preview_->SetPaintToLayer();
+@@ -299,4 +375,5 @@
+   handoff_offset_ = 0.0f;
+   SetOffset(start, kMinOpacity);
+   AnimateToRest(kSlideDuration);
++  ScheduleSnapshot(kSlideDuration + base::Milliseconds(50));
+ }
+--- a/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.h
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.h
+@@ -5,11 +5,17 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_BIBA_SPACE_SWIPE_HANDLER_H_
+ #define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_BIBA_SPACE_SWIPE_HANDLER_H_
+ 
++#include <map>
++#include <memory>
+ #include <vector>
+ 
+ #include "base/callback_list.h"
+ #include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/timer/timer.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "ui/gfx/image/image_skia.h"
+ #include "base/time/time.h"
+ #include "ui/events/event_handler.h"
+ 
+@@ -31,7 +37,8 @@
+ //    offset over so the motion is continuous.
+ //
+ // Only the views returned by `movable_views` move; the Space dots stay put.
+-class BibaSpaceSwipeHandler : public ui::EventHandler {
++class BibaSpaceSwipeHandler : public ui::EventHandler,
++                              public TabStripModelObserver {
+  public:
+   using MovableViewsGetter = base::RepeatingCallback<std::vector<views::View*>()>;
+ 
+@@ -46,6 +53,13 @@
+   // ui::EventHandler:
+   void OnScrollEvent(ui::ScrollEvent* event) override;
+ 
++  // TabStripModelObserver: keep the visible Space's snapshot fresh.
++  void OnTabStripModelChanged(TabStripModel* tab_strip_model,
++                              const TabStripModelChange& change,
++                              const TabStripSelectionChange& selection) override;
++  void OnTabChangedAt(tabs::TabInterface* tab,
++                      TabChangeType change_type) override;
++
+  private:
+   void OnSpaceChanged(int from, int to);
+   // Next (+1) / previous (-1) Space in use, or -1 if there is none.
+@@ -59,6 +73,11 @@
+   // Shows Space `space` as a preview at `offset` (loads it if needed).
+   void ShowPreview(int space, float offset, float opacity);
+   void HidePreview();
++  // Snapshots the visible Space's tab list (only when it's at rest).
++  void ScheduleSnapshot(base::TimeDelta delay);
++  void CaptureSnapshot();
++  // Height of the tab list area (above the Space dots), in DIPs.
++  int SnapshotClipHeight() const;
+ 
+   raw_ptr<BrowserWindowInterface> browser_;
+   raw_ptr<views::View> sidebar_;
+@@ -78,6 +97,11 @@
+   base::TimeTicks last_event_time_;
+   // Offset to start the next slide-in from (set when a swipe commits).
+   float handoff_offset_ = 0.0f;
++
++  // Pixel snapshots of each Space's tab list, taken while it was visible.
++  std::map<int, gfx::ImageSkia> snapshots_;
++  base::OneShotTimer snapshot_timer_;
++  base::WeakPtrFactory<BibaSpaceSwipeHandler> weak_factory_{this};
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_BIBA_SPACE_SWIPE_HANDLER_H_

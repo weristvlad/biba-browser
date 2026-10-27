@@ -1,0 +1,521 @@
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -5,6 +5,8 @@
+ #include "chrome/browser/ui/browser_command_controller.h"
+ 
+ #include "chrome/browser/ui/biba/biba_spaces_controller.h"
++#include "ui/base/base_window.h"
++#include "ui/views/widget/widget.h"
+ 
+ #include <stddef.h>
+ 
+@@ -358,6 +360,9 @@
+       browser_->GetType() == BrowserWindowInterface::TYPE_NORMAL) {
+     biba_spaces_ =
+         std::make_unique<BibaSpacesController>(browser_->GetTabStripModel());
++    biba_spaces_->set_on_space_changed(
++        base::BindRepeating(&BrowserCommandController::RepaintBibaFrame,
++                            base::Unretained(this)));
+     biba_spaces_->RunSelfTest(
+         browser_, base::CommandLine::ForCurrentProcess()->GetSwitchValuePath(
+                       "biba-spaces-selftest"));
+@@ -485,6 +490,31 @@
+       std::make_unique<ExtensionStateObserver>(this, profile());
+ }
+ 
++int BrowserCommandController::biba_active_space() const {
++  return biba_spaces_ ? biba_spaces_->active_space() : 0;
++}
++
++void BrowserCommandController::RepaintBibaFrame() {
++  // The frame colour follows the active Space; repaint every frame surface.
++  views::Widget* widget =
++      browser_->GetWindow()
++          ? views::Widget::GetWidgetForNativeWindow(
++                browser_->GetWindow()->GetNativeWindow())
++          : nullptr;
++  if (!widget || !widget->GetRootView()) {
++    return;
++  }
++  std::vector<views::View*> pending = {widget->GetRootView()};
++  while (!pending.empty()) {
++    views::View* view = pending.back();
++    pending.pop_back();
++    view->SchedulePaint();
++    for (views::View* child : view->children()) {
++      pending.push_back(child);
++    }
++  }
++}
++
+ BrowserCommandController::~BrowserCommandController() {
+   extension_state_observer_.reset();
+   // TabRestoreService may have been shutdown by the time we get here. Don't
+@@ -870,6 +900,9 @@
+       if (!biba_spaces_) {
+         biba_spaces_ = std::make_unique<BibaSpacesController>(
+             browser_->GetTabStripModel());
++        biba_spaces_->set_on_space_changed(base::BindRepeating(
++            &BrowserCommandController::RepaintBibaFrame,
++            base::Unretained(this)));
+       }
+       biba_spaces_->SwitchToSpace(id - IDC_BIBA_SWITCH_SPACE_0);
+       break;
+--- a/chrome/browser/ui/browser_command_controller.h
++++ b/chrome/browser/ui/browser_command_controller.h
+@@ -123,6 +123,10 @@
+       CommandUpdater* command_updater,
+       Profile* profile);
+ 
++  // Biba: index of the Space shown in this window (0 when Spaces were never
++  // used).
++  int biba_active_space() const;
++
+  private:
+ #if BUILDFLAG(IS_CHROMEOS)
+   friend class BrowserCommandControllerBrowserTestLockedFullscreen;
+@@ -292,6 +296,9 @@
+ 
+   const raw_ptr<BrowserWindowInterface> browser_;
+ 
++  // Biba: repaints the frame after the active Space changed.
++  void RepaintBibaFrame();
++
+   // Biba: Spaces of this window. Created on first use.
+   std::unique_ptr<BibaSpacesController> biba_spaces_;
+ 
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -135,7 +135,7 @@
+ 
+   registry->RegisterBooleanPref(prefs::kHeliumRoundedFrame, true);
+ 
+-  registry->RegisterBooleanPref(prefs::kHeliumNativeFrameMaterials, true);  // Biba
++  registry->RegisterBooleanPref(prefs::kHeliumNativeFrameMaterials, false);
+ 
+   registry->RegisterBooleanPref(prefs::kHeliumCenteredLocationBar, false);
+ 
+--- a/chrome/browser/ui/ui_features.cc
++++ b/chrome/browser/ui/ui_features.cc
+@@ -36,7 +36,7 @@
+ // Enables the migration of browser commands to Action API.
+ BASE_FEATURE(kUseActionsForBrowserCommands, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+-BASE_FEATURE(kHeliumNativeFrameMaterials, base::FEATURE_ENABLED_BY_DEFAULT);  // Biba
++BASE_FEATURE(kHeliumNativeFrameMaterials, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+ BASE_FEATURE(kHeliumHidePageActions, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+--- a/chrome/browser/ui/views/frame/BUILD.gn
++++ b/chrome/browser/ui/views/frame/BUILD.gn
+@@ -846,6 +846,23 @@
+   ]
+ }
+ 
++source_set("biba_frame_paint") {
++  sources = [
++    "biba_frame_paint.cc",
++    "biba_frame_paint.h",
++  ]
++  deps = [
++    ":browser_view_header",
++    "//base",
++    "//cc/paint",
++    "//chrome/browser/ui:browser_command_controller",
++    "//skia",
++    "//ui/color",
++    "//ui/gfx",
++    "//ui/views",
++  ]
++}
++
+ source_set("themed_background_impl") {
+   sources = [ "themed_background.cc" ]
+   public_deps = [
+@@ -853,6 +870,7 @@
+     "//chrome/browser:browser_public_dependencies",
+   ]
+   deps = [
++    ":biba_frame_paint",
+     ":top_container_view",
+     "//base",
+     "//chrome/app/theme:theme_resources",
+@@ -1593,6 +1611,7 @@
+       "//ui/gfx/geometry",
+     ]
+     deps = [
++      ":biba_frame_paint",
+       ":browser_native_widget",
+       ":browser_view_header",
+       ":browser_widget",
+--- /dev/null
++++ b/chrome/browser/ui/views/frame/biba_frame_paint.cc
+@@ -0,0 +1,151 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/frame/biba_frame_paint.h"
++
++#include <array>
++#include <cstdint>
++#include <utility>
++
++#include "base/no_destructor.h"
++#include "chrome/browser/ui/browser_command_controller.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "cc/paint/paint_flags.h"
++#include "cc/paint/paint_image.h"
++#include "cc/paint/paint_shader.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "third_party/skia/include/core/SkColor.h"
++#include "third_party/skia/include/core/SkMatrix.h"
++#include "ui/color/color_id.h"
++#include "ui/color/color_provider.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/color_utils.h"
++#include "ui/gfx/geometry/point.h"
++#include "ui/views/view.h"
++#include "ui/views/widget/widget.h"
++
++namespace biba {
++
++namespace {
++
++// One accent per Space slot (Ctrl+1..9). Saturated mid-tones; how much of the
++// accent reaches the frame is decided by kTint* below.
++constexpr std::array<SkColor, 9> kSpaceAccents = {
++    SkColorSetRGB(0x8B, 0x5C, 0xF6),  // violet
++    SkColorSetRGB(0x3B, 0x82, 0xF6),  // blue
++    SkColorSetRGB(0x10, 0xB9, 0x81),  // green
++    SkColorSetRGB(0xF5, 0x9E, 0x0B),  // amber
++    SkColorSetRGB(0xEC, 0x48, 0x99),  // pink
++    SkColorSetRGB(0xEF, 0x44, 0x44),  // red
++    SkColorSetRGB(0x06, 0xB6, 0xD4),  // cyan
++    SkColorSetRGB(0x84, 0xCC, 0x16),  // lime
++    SkColorSetRGB(0x9C, 0xA3, 0xAF),  // neutral
++};
++
++// Base surfaces the accent is blended into.
++constexpr SkColor kDarkBase = SkColorSetRGB(0x16, 0x16, 0x1A);
++constexpr SkColor kLightBase = SkColorSetRGB(0xF4, 0xF3, 0xF1);
++
++// Accent share at the gradient's two ends (top-left, bottom-right).
++constexpr float kTintStartDark = 0.42f;
++constexpr float kTintEndDark = 0.20f;
++constexpr float kTintStartLight = 0.40f;
++constexpr float kTintEndLight = 0.20f;
++
++// Rotates `color`'s hue by `degrees` (analogous companion for the gradient).
++SkColor RotateHue(SkColor color, double degrees) {
++  color_utils::HSL hsl;
++  color_utils::SkColorToHSL(color, &hsl);
++  hsl.h += degrees / 360.0;
++  if (hsl.h >= 1.0) {
++    hsl.h -= 1.0;
++  }
++  return color_utils::HSLToSkColor(hsl, SK_AlphaOPAQUE);
++}
++
++// 128x128 tile of monochrome noise, generated once. Alpha is tiny so the grain
++// reads as texture, not as dirt.
++const cc::PaintImage& GrainTile() {
++  static const base::NoDestructor<cc::PaintImage> tile([] {
++    constexpr int kSize = 128;
++    SkBitmap bitmap;
++    bitmap.allocN32Pixels(kSize, kSize);
++    // xorshift32: deterministic, so the grain looks the same every launch.
++    uint32_t state = 0x9E3779B9u;
++    auto next = [&state] {
++      state ^= state << 13;
++      state ^= state >> 17;
++      state ^= state << 5;
++      return state;
++    };
++    for (int y = 0; y < kSize; ++y) {
++      for (int x = 0; x < kSize; ++x) {
++        const uint32_t r = next();
++        const bool light = (r & 1u) != 0;
++        const U8CPU alpha = static_cast<U8CPU>((r >> 1) % 11);
++        *bitmap.getAddr32(x, y) =
++            light ? SkPreMultiplyARGB(alpha, 255, 255, 255)
++                  : SkPreMultiplyARGB(alpha, 0, 0, 0);
++      }
++    }
++    bitmap.setImmutable();
++    return cc::PaintImage::CreateFromBitmap(std::move(bitmap));
++  }());
++  return *tile;
++}
++
++}  // namespace
++
++bool PaintSpaceFrame(gfx::Canvas* canvas,
++                     const views::View* view,
++                     const BrowserView* browser_view) {
++  if (!browser_view || !browser_view->GetIsNormalType() ||
++      !view->GetWidget()) {
++    return false;
++  }
++
++  int space = 0;
++  if (const auto* commands = chrome::BrowserCommandController::From(
++          const_cast<BrowserView*>(browser_view)->browser())) {
++    space = commands->biba_active_space();
++  }
++  const SkColor accent = kSpaceAccents[space % kSpaceAccents.size()];
++
++  const bool dark = color_utils::IsDark(
++      view->GetColorProvider()->GetColor(ui::kColorSysSurface));
++  const SkColor base = dark ? kDarkBase : kLightBase;
++  const SkColor start = color_utils::AlphaBlend(
++      accent, base, dark ? kTintStartDark : kTintStartLight);
++  const SkColor end = color_utils::AlphaBlend(
++      RotateHue(accent, 28), base, dark ? kTintEndDark : kTintEndLight);
++
++  // Lay the gradient out across the whole widget, then shift into `view`'s
++  // coordinates, so sibling frame views continue the same gradient.
++  const gfx::Rect widget_bounds =
++      view->GetWidget()->GetRootView()->GetLocalBounds();
++  gfx::Point origin;
++  views::View::ConvertPointToWidget(view, &origin);
++  const SkPoint points[2] = {
++      SkPoint::Make(-origin.x(), -origin.y()),
++      SkPoint::Make(widget_bounds.width() - origin.x(),
++                    widget_bounds.height() - origin.y())};
++  const SkColor4f colors[2] = {SkColor4f::FromColor(start),
++                               SkColor4f::FromColor(end)};
++
++  cc::PaintFlags flags;
++  flags.setShader(cc::PaintShader::MakeLinearGradient(
++      points, colors, nullptr, 2, SkTileMode::kClamp));
++  canvas->DrawRect(gfx::RectF(view->GetLocalBounds()), flags);
++
++  // Grain, anchored to the widget so it doesn't swim between views.
++  cc::PaintFlags grain;
++  SkMatrix offset = SkMatrix::Translate(-origin.x(), -origin.y());
++  grain.setShader(cc::PaintShader::MakeImage(
++      GrainTile(), SkTileMode::kRepeat,
++      SkTileMode::kRepeat, &offset));
++  canvas->DrawRect(gfx::RectF(view->GetLocalBounds()), grain);
++  return true;
++}
++
++}  // namespace biba
+--- /dev/null
++++ b/chrome/browser/ui/views/frame/biba_frame_paint.h
+@@ -0,0 +1,31 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_FRAME_BIBA_FRAME_PAINT_H_
++#define CHROME_BROWSER_UI_VIEWS_FRAME_BIBA_FRAME_PAINT_H_
++
++class BrowserView;
++
++namespace gfx {
++class Canvas;
++}
++
++namespace views {
++class View;
++}
++
++namespace biba {
++
++// Paints the window frame surface (sidebar + top bar) for `view` with the
++// active Space's colour: a soft diagonal gradient laid out in widget
++// coordinates, so every frame view lines up into one surface, plus a faint
++// grain. Returns false when Biba frame painting doesn't apply (non-normal
++// windows), in which case the caller paints as before.
++bool PaintSpaceFrame(gfx::Canvas* canvas,
++                     const views::View* view,
++                     const BrowserView* browser_view);
++
++}  // namespace biba
++
++#endif  // CHROME_BROWSER_UI_VIEWS_FRAME_BIBA_FRAME_PAINT_H_
+--- a/chrome/browser/ui/views/frame/browser_frame_view_mac.mm
++++ b/chrome/browser/ui/views/frame/browser_frame_view_mac.mm
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/views/frame/browser_frame_view_mac.h"
+ 
++#include "chrome/browser/ui/views/frame/biba_frame_paint.h"
++
+ #include <algorithm>
+ #include <vector>
+ 
+@@ -602,6 +604,10 @@
+     return;
+   }
+ 
++  if (biba::PaintSpaceFrame(canvas, this, GetBrowserView())) {
++    return;
++  }
++
+   const SkColor frame_color =
+       GetFrameColor(BrowserFrameActiveState::kUseCurrent);
+   canvas->DrawColor(frame_color);
+--- a/chrome/browser/ui/views/frame/themed_background.cc
++++ b/chrome/browser/ui/views/frame/themed_background.cc
+@@ -4,6 +4,10 @@
+ 
+ #include "chrome/browser/ui/views/frame/themed_background.h"
+ 
++#include <string_view>
++
++#include "chrome/browser/ui/views/frame/biba_frame_paint.h"
++
+ #include <optional>
+ 
+ #include "chrome/browser/themes/theme_properties.h"
+@@ -112,6 +116,15 @@
+                                        const views::View* view,
+                                        const BrowserView* browser_view,
+                                        ThemeChoice theme_choice) {
++  // Biba: the toolbar row belongs to the window frame (one tinted surface with
++  // the sidebar); only the content card keeps the toolbar colour.
++  const bool biba_frame_surface =
++      theme_choice == ThemeChoice::kFrameTheme ||
++      std::string_view(view->GetClassName()) == "ToolbarView";
++  if (biba_frame_surface &&
++      biba::PaintSpaceFrame(canvas, view, browser_view)) {
++    return;
++  }
+   bool painted =
+       PaintThemeCustomImage(canvas, view, browser_view, theme_choice);
+   if (!painted) {
+--- a/chrome/browser/ui/biba/biba_spaces_controller.cc
++++ b/chrome/browser/ui/biba/biba_spaces_controller.cc
+@@ -20,6 +20,8 @@
+ #include "ui/base/base_window.h"
+ #include "ui/gfx/geometry/rect.h"
+ #include "ui/snapshot/snapshot.h"
++#include "ui/views/view.h"
++#include "ui/views/widget/widget.h"
+ #include "chrome/browser/ui/tabs/tab_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+@@ -76,6 +78,9 @@
+   // Park the outgoing Space.
+   current.items = model->DetachTabsAndCollectionsForInsertion(outgoing);
+   active_space_ = index;
++  if (on_space_changed_) {
++    on_space_changed_.Run();
++  }
+ }
+ 
+ tabs::TabInterface* BibaSpacesController::AttachSpace(Space& space) {
+@@ -129,7 +134,12 @@
+       base::Seconds(8));
+ }
+ 
++void BibaDumpViewsAt(BrowserWindowInterface* browser, int x, int y);
++
+ void BibaSpacesController::SelfTestStep(int step) {
++  if (step == 0) {
++    BibaDumpViewsAt(debug_browser_, 30, 20);
++  }
+   // 0: initial, 1: -> Space 2 (fresh), 2: -> Space 1, 3: -> Space 2 again,
+   // 4: -> Space 1 again.
+   static constexpr int kTarget[] = {-1, 1, 0, 1, 0};
+@@ -202,3 +212,32 @@
+           },
+           path));
+ }
++
++// DEBUG: dumps the views under widget point (x, y), outermost first.
++void BibaDumpViewsAt(BrowserWindowInterface* browser, int x, int y) {
++  if (!browser || !browser->GetWindow()) {
++    return;
++  }
++  views::Widget* widget = views::Widget::GetWidgetForNativeWindow(
++      browser->GetWindow()->GetNativeWindow());
++  if (!widget) {
++    return;
++  }
++  std::vector<std::pair<views::View*, int>> stack = {{widget->GetRootView(), 0}};
++  while (!stack.empty()) {
++    auto [view, depth] = stack.back();
++    stack.pop_back();
++    gfx::Point p(x, y);
++    views::View::ConvertPointFromWidget(view, &p);
++    if (!view->GetLocalBounds().Contains(p) || !view->GetVisible()) {
++      continue;
++    }
++    LOG(ERROR) << "[biba-views] " << std::string(depth * 2, ' ')
++               << view->GetClassName() << " " << view->bounds().ToString()
++               << (view->background() ? " BG" : "")
++               << (view->layer() ? " LAYER" : "");
++    for (views::View* child : view->children()) {
++      stack.push_back({child, depth + 1});
++    }
++  }
++}
+--- a/chrome/browser/ui/biba/biba_spaces_controller.h
++++ b/chrome/browser/ui/biba/biba_spaces_controller.h
+@@ -12,6 +12,7 @@
+ 
+ #include "base/memory/raw_ptr.h"
+ #include "base/files/file_path.h"
++#include "base/functional/callback.h"
+ #include "base/memory/weak_ptr.h"
+ 
+ class BrowserWindowInterface;
+@@ -41,6 +42,11 @@
+ 
+   int active_space() const { return active_space_; }
+ 
++  // Called after the visible Space changed (e.g. to repaint the frame).
++  void set_on_space_changed(base::RepeatingClosure callback) {
++    on_space_changed_ = std::move(callback);
++  }
++
+   // Makes Space `index` (0-based) the visible one. A Space that has never
+   // been opened starts with a single new tab.
+   void SwitchToSpace(int index);
+@@ -74,6 +80,7 @@
+   raw_ptr<TabStripModel> tab_strip_model_;
+   std::array<Space, kMaxSpaces> spaces_;
+   int active_space_ = 0;
++  base::RepeatingClosure on_space_changed_;
+ 
+   void SelfTestStep(int step);
+   void LogStrip(const char* label);
+--- a/chrome/browser/ui/views/frame/custom_corners.cc
++++ b/chrome/browser/ui/views/frame/custom_corners.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/views/frame/custom_corners.h"
+ 
++#include <string_view>
++
+ #include "base/check_op.h"
+ #include "base/i18n/rtl.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+@@ -44,7 +46,12 @@
+     return;
+   }
+ 
+-  if (std::holds_alternative<ToolbarTheme>(color_choice.color) ||
++  // Biba: the top container sits under the traffic lights; it's part of the
++  // tinted window frame, whatever colour the layout assigned to it.
++  const bool biba_top_container =
++      std::string_view(GetView().GetClassName()) == "TopContainerView";
++  if (biba_top_container ||
++      std::holds_alternative<ToolbarTheme>(color_choice.color) ||
+       std::holds_alternative<FrameTheme>(color_choice.color)) {
+     gfx::ScopedCanvas scoped(canvas);
+     canvas->ClipPath(path, anti_alias);
+@@ -58,7 +65,8 @@
+     }
+     ThemedBackground::PaintBackground(
+         canvas, &GetView(), &browser_view(),
+-        std::holds_alternative<ToolbarTheme>(color_choice.color)
++        !biba_top_container &&
++                std::holds_alternative<ToolbarTheme>(color_choice.color)
+             ? ThemedBackground::ThemeChoice::kToolbarTheme
+             : ThemedBackground::ThemeChoice::kFrameTheme);
+   } else {

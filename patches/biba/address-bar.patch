@@ -1,0 +1,188 @@
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -139,7 +139,7 @@
+ 
+   registry->RegisterBooleanPref(prefs::kHeliumCenteredLocationBar, false);
+ 
+-  registry->RegisterBooleanPref(prefs::kHeliumMinimalLocationBar, false);
++  registry->RegisterBooleanPref(prefs::kHeliumMinimalLocationBar, true);  // Biba
+ 
+   registry->RegisterBooleanPref(prefs::kHeliumShowProgressBar, true);
+ 
+--- a/chrome/browser/ui/views/location_bar/location_bar_view.cc
++++ b/chrome/browser/ui/views/location_bar/location_bar_view.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/ui/views/location_bar/location_bar_view.h"
++#include "chrome/common/pref_names.h"
++#include "content/public/common/url_constants.h"
++#include "base/strings/utf_string_conversions.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -174,6 +177,21 @@
+ #include "chrome/browser/web_applications/web_app_tab_helper.h"
+ #endif
+ 
++// Biba: tells the location bar when the page title changes.
++class BibaTitleWatcher : public content::WebContentsObserver {
++ public:
++  BibaTitleWatcher(content::WebContents* contents,
++                   base::RepeatingClosure on_change)
++      : content::WebContentsObserver(contents),
++        on_change_(std::move(on_change)) {}
++  void TitleWasSet(content::NavigationEntry* entry) override {
++    on_change_.Run();
++  }
++
++ private:
++  base::RepeatingClosure on_change_;
++};
++
+ namespace {
+ 
+ int IncrementalMinimumWidth(const views::View* view) {
+@@ -384,6 +402,12 @@
+ 
+   omnibox_view_ = AddChildView(std::move(omnibox_view));
+   omnibox_view_->Init();
++  biba_title_label_ = AddChildView(std::make_unique<views::Label>());
++  biba_title_label_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++  biba_title_label_->SetElideBehavior(gfx::ELIDE_TAIL);
++  biba_title_label_->SetAutoColorReadabilityEnabled(false);
++  biba_title_label_->SetCanProcessEventsWithinSubtree(false);
++  biba_title_label_->SetVisible(false);
+ 
+   if (CanHostWebUIOmnibox(browser_, is_popup_mode_)) {
+     if (omnibox::IsAimPopupFeatureEnabled()) {
+@@ -1093,6 +1117,7 @@
+   loading_progress_view_->SetBoundsRect(GetLocalBounds());
+ 
+   LayoutSuperclass<View>(this);
++  LayoutBibaTitle();
+ }
+ 
+ void LocationBarView::OnThemeChanged() {
+@@ -1131,6 +1156,15 @@
+   location_icon_view_->Update(
+       /*suppress_animations=*/contents, GetOmniboxController()->IsPopupOpen());
+ 
++  if (WebContents* active = GetWebContents()) {
++    biba_title_watcher_ = std::make_unique<BibaTitleWatcher>(
++        active, base::BindRepeating(&LocationBarView::RefreshBibaTitle,
++                                    base::Unretained(this)));
++  } else {
++    biba_title_watcher_.reset();
++  }
++  RefreshBibaTitle();
++
+   if (contents) {
+     omnibox_view_->OnTabChanged(contents);
+     if (is_full_webui_omnibox_ &&
+@@ -1468,7 +1502,10 @@
+                              ui::NativeTheme::PreferredContrast::kMore;
+ 
+   const auto* const color_provider = GetColorProvider();
+-  SkColor normal = color_provider->GetColor(kColorLocationBarBackground);
++  // Biba: no pill at rest; the field shows itself on hover and focus.
++  SkColor normal = is_popup_mode_
++                       ? color_provider->GetColor(kColorLocationBarBackground)
++                       : SK_ColorTRANSPARENT;
+   SkColor hovered =
+       color_provider->GetColor(kColorLocationBarBackgroundHovered);
+ 
+@@ -1512,6 +1549,7 @@
+ 
+   // The location bar already paints the background behind the text field.
+   omnibox_view_->SetBackgroundColor(SK_ColorTRANSPARENT);
++  RefreshBibaTitle();
+ 
+   // The divider between indicators and request chips should have the same color
+   // as the omnibox.
+@@ -2517,3 +2555,47 @@
+ ADD_READONLY_PROPERTY_METADATA(gfx::Rect, LocalBoundsWithoutEndcaps)
+ ADD_READONLY_PROPERTY_METADATA(bool, PopupMode)
+ END_METADATA
++
++void LocationBarView::RefreshBibaTitle() {
++  if (!biba_title_label_ || !omnibox_view_) {
++    return;
++  }
++  auto* edit_model = GetOmniboxController()->edit_model();
++  const bool at_rest = !edit_model->user_input_in_progress() &&
++                       !edit_model->is_caret_visible() &&
++                       !omnibox_view_->HasFocus();
++  const bool minimal =
++      GetProfile() &&
++      GetProfile()->GetPrefs()->GetBoolean(prefs::kHeliumMinimalLocationBar);
++  WebContents* contents = GetWebContents();
++  std::u16string title = contents ? contents->GetTitle() : std::u16string();
++  const GURL url = contents ? contents->GetVisibleURL() : GURL();
++  // The title adds nothing when it just repeats the address.
++  const bool useful = !title.empty() && url.is_valid() &&
++                      !url.SchemeIs(content::kChromeUIScheme) &&
++                      title != base::UTF8ToUTF16(url.host()) &&
++                      title != base::UTF8ToUTF16(url.spec());
++  const bool show = at_rest && minimal && useful && !is_popup_mode_;
++  biba_title_label_->SetVisible(show);
++  if (show) {
++    biba_title_label_->SetText(u" / " + title);
++    biba_title_label_->SetFontList(omnibox_view_->GetFontList());
++    if (const auto* color_provider = GetColorProvider()) {
++      biba_title_label_->SetEnabledColor(
++          color_provider->GetColor(kColorOmniboxTextDimmed));
++    }
++    LayoutBibaTitle();
++  }
++}
++
++void LocationBarView::LayoutBibaTitle() {
++  if (!biba_title_label_ || !biba_title_label_->GetVisible()) {
++    return;
++  }
++  // Right after the URL text, within the omnibox's slot.
++  const gfx::Rect omnibox = omnibox_view_->bounds();
++  const int text_end = omnibox.x() + omnibox_view_->GetInsets().left() +
++                       omnibox_view_->GetUnelidedTextWidth();
++  const int width = std::max(0, omnibox.right() - text_end);
++  biba_title_label_->SetBounds(text_end, omnibox.y(), width, omnibox.height());
++}
+--- a/chrome/browser/ui/views/location_bar/location_bar_view.h
++++ b/chrome/browser/ui/views/location_bar/location_bar_view.h
+@@ -70,6 +70,8 @@
+ class SelectedKeywordView;
+ class PrefChangeRegistrar;
+ 
++class BibaTitleWatcher;
++
+ namespace extensions {
+ class ExtensionDebuggerWarningView;
+ }  // namespace extensions
+@@ -542,6 +544,13 @@
+   // when user input is not in progress.
+   raw_ptr<OmniboxViewViews> omnibox_view_ = nullptr;
+ 
++  // Biba: " / page title" shown after the minimal URL while the omnibox is at
++  // rest (Dia-style address bar).
++  void RefreshBibaTitle();
++  void LayoutBibaTitle();
++  raw_ptr<views::Label> biba_title_label_ = nullptr;
++  std::unique_ptr<BibaTitleWatcher> biba_title_watcher_;
++
+   // The view holding the regular results popup.
+   std::unique_ptr<OmniboxPopupView> omnibox_popup_view_;
+   // The presenter controlling the showing of the AI mode popup.
+--- a/chrome/browser/ui/views/omnibox/omnibox_view_views.cc
++++ b/chrome/browser/ui/views/omnibox/omnibox_view_views.cc
+@@ -988,8 +988,8 @@
+   if (controller()->edit_model()->focus_state() == OMNIBOX_FOCUS_NONE &&
+       !controller()->edit_model()->user_input_in_progress() &&
+       location_bar_view_ && location_bar_view_->GetProfile()) {
+-    center_text = location_bar_view_->GetProfile()->GetPrefs()->GetBoolean(
+-        prefs::kHeliumMinimalLocationBar);
++    // Biba: keep the minimal URL left-aligned; the page title follows it.
++    center_text = false;
+   }
+ 
+   SetHorizontalAlignment(center_text ? gfx::ALIGN_CENTER : gfx::ALIGN_LEFT);

@@ -1,0 +1,33 @@
+--- a/chrome/app/theme/chromium/BRANDING
++++ b/chrome/app/theme/chromium/BRANDING
+@@ -1,10 +1,10 @@
+-COMPANY_FULLNAME=The Helium Authors
+-COMPANY_SHORTNAME=The Helium Authors
+-PRODUCT_FULLNAME=Helium
+-PRODUCT_SHORTNAME=Helium
+-PRODUCT_INSTALLER_FULLNAME=Helium Installer
+-PRODUCT_INSTALLER_SHORTNAME=Helium Installer
+-COPYRIGHT=Copyright @LASTCHANGE_YEAR@ The Helium Authors. All rights reserved.
+-MAC_BUNDLE_ID=net.imput.helium
++COMPANY_FULLNAME=The Biba Authors
++COMPANY_SHORTNAME=The Biba Authors
++PRODUCT_FULLNAME=Biba
++PRODUCT_SHORTNAME=Biba
++PRODUCT_INSTALLER_FULLNAME=Biba Installer
++PRODUCT_INSTALLER_SHORTNAME=Biba Installer
++COPYRIGHT=Copyright @LASTCHANGE_YEAR@ The Biba Authors. All rights reserved.
++MAC_BUNDLE_ID=com.weristvlad.biba
+ MAC_CREATOR_CODE=Cr24
+-MAC_TEAM_ID=S4Q33XPHB4
++MAC_TEAM_ID=0000000000
+--- a/chrome/common/chrome_paths_mac.mm
++++ b/chrome/common/chrome_paths_mac.mm
+@@ -32,7 +32,7 @@
+     product_dir_name = [product_dir_name_ns fileSystemRepresentation];
+ 
+     if (!product_dir_name) {
+-      product_dir_name = "net.imput.helium";
++      product_dir_name = "com.weristvlad.biba";
+     }
+ 
+     // Leaked, but the only caller initializes a static with this result, so it

@@ -1,0 +1,43 @@
+--- a/chrome/browser/ui/tabs/tab_creation_metrics_controller.cc
++++ b/chrome/browser/ui/tabs/tab_creation_metrics_controller.cc
+@@ -41,6 +41,10 @@
+ TabCreationMetricsController::~TabCreationMetricsController() = default;
+ 
+ void TabCreationMetricsController::ScheduleRecordTabGroupingTransition() {
++  // Biba: a tab can live detached in an inactive Space.
++  if (!tab_->GetBrowserWindowInterface()) {
++    return;
++  }
+   TabStripModel* tab_strip_model =
+       tab_->GetBrowserWindowInterface()->GetTabStripModel();
+   if (!tab_strip_model) {
+@@ -70,7 +74,8 @@
+ 
+ void TabCreationMetricsController::RecordTabGroupingTransition(
+     std::optional<tab_groups::TabGroupId> last_active_group_id) {
+-  if (!tab_) {
++  // Biba: the tab may have been parked in an inactive Space since scheduling.
++  if (!tab_ || !tab_->GetBrowserWindowInterface()) {
+     return;
+   }
+ 
+--- a/chrome/browser/ui/biba/biba_spaces_controller.cc
++++ b/chrome/browser/ui/biba/biba_spaces_controller.cc
+@@ -276,8 +276,15 @@
+       if (click_copy) {
+         for (views::View* child : view->children()) {
+           auto* button = views::AsViewClass<views::ImageButton>(child);
+-          if (button && button->GetVisible() &&
+-              button->GetTooltipText() == u"Copy link") {
++          if (button) {
++            LOG(ERROR) << "[biba-selftest] tab button tooltip="
++                       << button->GetTooltipText()
++                       << " visible=" << button->GetVisible()
++                       << " bounds=" << button->bounds().ToString();
++          }
++          if (button && button->GetTooltipText() == u"Copy link") {
++            button->SetVisible(true);
++            button->SetBounds(0, 0, 16, 16);
+             const gfx::Point c = button->GetLocalBounds().CenterPoint();
+             ui::MouseEvent press(ui::EventType::kMousePressed, c, c,
+                                  base::TimeTicks::Now(),

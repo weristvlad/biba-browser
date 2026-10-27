@@ -1,0 +1,79 @@
+--- a/chrome/browser/ui/biba/biba_spaces_controller.cc
++++ b/chrome/browser/ui/biba/biba_spaces_controller.cc
+@@ -15,6 +15,7 @@
+ #include <set>
+ 
+ #include "base/check_op.h"
++#include "base/command_line.h"
+ #include "base/logging.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+@@ -398,6 +399,17 @@
+ void BibaPokeFirstTab(BrowserWindowInterface* browser, bool click_copy);
+ 
+ void BibaSpacesController::SelfTestStep(int step) {
++  // DEBUG: --biba-pin-tabs=N pins the first N tabs before the run.
++  if (step == 0) {
++    int pin = 0;
++    if (base::StringToInt(base::CommandLine::ForCurrentProcess()
++                              ->GetSwitchValueASCII("biba-pin-tabs"),
++                          &pin)) {
++      for (int i = 0; i < pin && i < tab_strip_model_->count(); ++i) {
++        tab_strip_model_->SetTabPinned(i, true);
++      }
++    }
++  }
+   if (step == 0) {
+     BibaPokeFirstTab(debug_browser_, /*click_copy=*/false);
+   }
+--- a/chrome/browser/ui/views/tabs/common/tab_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view.cc
+@@ -1249,11 +1249,10 @@
+       SetBorder(views::CreateEmptyBorder(gfx::Insets(GetLayoutConstant(
+           LayoutConstant::kVerticalTabPinnedBorderThickness))));
+     } else {
+-      SetBorder(views::CreateRoundedRectBorder(
+-          GetLayoutConstant(LayoutConstant::kVerticalTabPinnedBorderThickness),
+-          GetLayoutConstant(LayoutConstant::kVerticalTabCornerRadius),
+-          IsFrameActive() ? kColorVerticalTabPinnedOutline
+-                          : kColorTabDividerFrameInactive));
++      // Biba (Dia): pinned tiles are soft filled squares, not outlines (the
++      // fill comes from VerticalTabStyleViews); keep the same insets.
++      SetBorder(views::CreateEmptyBorder(gfx::Insets(GetLayoutConstant(
++          LayoutConstant::kVerticalTabPinnedBorderThickness))));
+     }
+   } else if (GetBorder()) {
+     SetBorder(nullptr);
+--- a/chrome/browser/ui/views/tabs/common/vertical_tab_style_views.cc
++++ b/chrome/browser/ui/views/tabs/common/vertical_tab_style_views.cc
+@@ -203,6 +203,11 @@
+     return true;
+   }
+ 
++  // Biba (Dia): pinned tiles always show their soft fill.
++  if (delegate_->IsPinned()) {
++    return true;
++  }
++
+   if (has_custom_background) {
+     return false;
+   }
+@@ -230,10 +235,15 @@
+       case TabStyle::TabSelectionState::kSelected:
+         alpha = dark ? 0.09f : 0.40f;
+         break;
+-      case TabStyle::TabSelectionState::kInactive:
+-        alpha = (dark ? 0.07f : 0.30f) *
+-                static_cast<float>(delegate_->GetHoverAnimationValue());
++      case TabStyle::TabSelectionState::kInactive: {
++        const float hover =
++            static_cast<float>(delegate_->GetHoverAnimationValue());
++        // Pinned tiles rest at a soft fill and brighten on hover.
++        const float rest =
++            delegate_->IsPinned() ? (dark ? 0.08f : 0.40f) : 0.0f;
++        alpha = rest + (dark ? 0.07f : 0.30f) * hover;
+         break;
++      }
+     }
+     return SkColorSetA(SK_ColorWHITE, static_cast<U8CPU>(alpha * 255.0f));
+   }

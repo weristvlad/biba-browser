@@ -1,0 +1,239 @@
+--- a/chrome/browser/ui/layout_constants.cc
++++ b/chrome/browser/ui/layout_constants.cc
+@@ -77,7 +77,7 @@
+     case LayoutConstant::kLocationBarTrailingDecorationInnerPadding:
+       return touch_ui ? 3 : 8;
+     case LayoutConstant::kLocationBarHeight:
+-      return touch_ui ? 36 : 32;  // Biba (Dia)
++      return touch_ui ? 36 : 30;  // Biba (Dia): 30pt address capsule.
+     // LINT.IfChange(LocationBarIconSize)
+     case LayoutConstant::kLocationBarIconSize:
+       return touch_ui ? 20 : 16;
+@@ -122,7 +122,7 @@
+     case LayoutConstant::kTabstripToolbarOverlap:
+       return 0;
+     case LayoutConstant::kToolbarButtonHeight:
+-      return touch_ui ? 48 : 32;  // Biba (Dia): roomier toolbar.
++      return touch_ui ? 48 : 30;  // Biba (Dia): 30x30 toolbar buttons.
+     case LayoutConstant::kToolbarButtonIconSize:
+       return touch_ui ? kDefaultTouchableIconSize
+                       : kDefaultIconSizeChromeRefresh;
+@@ -135,8 +135,8 @@
+     case LayoutConstant::kToolbarDividerWidth:
+       return 1;
+     case LayoutConstant::kToolbarElementPadding:
+-      // Biba (Dia): more air between toolbar buttons.
+-      return touch_ui ? 0 : 8;
++      // Biba (Dia): 5pt between toolbar buttons.
++      return touch_ui ? 0 : 5;
+     case LayoutConstant::kToolbarIconDefaultMargin:
+       return touch_ui ? 0 : GetLayoutConstant(LayoutConstant::kHeliumBasePadding);
+     case LayoutConstant::kToolbarButtonRefreshExpandedMargin:
+@@ -157,9 +157,9 @@
+     case LayoutConstant::kVerticalTabCornerRadius:
+       return 10;
+     case LayoutConstant::kVerticalTabHeight:
+-      return 34;
++      return 37;  // Dia: 37pt rows.
+     case LayoutConstant::kVerticalTabPinnedHeight:
+-      return 40;
++      return 41;  // Dia: 41pt tiles.
+     case LayoutConstant::kVerticalTabMinWidth:
+       return 30;
+     case LayoutConstant::kVerticalTabStripHorizontalPadding:
+@@ -240,8 +240,8 @@
+       }
+ 
+     case TOOLBAR_INTERIOR_MARGIN:
+-      // Biba (Dia): a 40pt toolbar with roomy ends.
+-      return gfx::Insets::TLBR(6, 10, 6, 8);
++      // Biba (Dia): a 42pt row: 30pt buttons, 6pt all round.
++      return gfx::Insets(6);
+ 
+     case WEBUI_TAB_STRIP_TOOLBAR_INTERIOR_MARGIN:
+       return gfx::Insets::VH(4, 0);
+--- a/chrome/browser/ui/views/frame/multi_contents_view.h
++++ b/chrome/browser/ui/views/frame/multi_contents_view.h
+@@ -62,8 +62,8 @@
+     int end = 0;
+   };
+ 
+-  // Biba: Dia-like air around the content card (was 3).
+-  static constexpr int kSplitViewContentInset = 8;
++  // Biba: Dia's card inset (window radius 16 - card radius 10 = 6; was 3).
++  static constexpr int kSplitViewContentInset = 6;
+ 
+   MultiContentsView(BrowserView* browser_view,
+                     std::unique_ptr<MultiContentsViewDelegate> delegate);
+--- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
+@@ -27,7 +27,8 @@
+ #include "ui/views/view_utils.h"
+ 
+ namespace {
+-constexpr int kTabPadding = 4;
++// Biba (Dia): 6pt between pinned tiles.
++constexpr int kTabPadding = 6;
+ }  // namespace
+ 
+ PinnedTabContainerView::PinnedTabContainerView(
+--- a/chrome/browser/ui/views/frame/biba_frame_paint.cc
++++ b/chrome/browser/ui/views/frame/biba_frame_paint.cc
+@@ -12,6 +12,8 @@
+ #include <map>
+ 
+ #include "base/no_destructor.h"
++#include "ui/gfx/animation/tween.h"
++#include "base/task/sequenced_task_runner.h"
+ #include "url/gurl.h"
+ #include "ui/views/view_tracker.h"
+ #include "ui/views/biba_color_override.h"
+@@ -180,7 +182,12 @@
+   bool pending = false;
+   // What the toolbar was last painted with, to skip needless repaints.
+   std::optional<SkColor> applied;
++  // Dia cross-fades the bar between page colours.
++  std::optional<SkColor> fade_from;
++  base::TimeTicks fade_start;
+ };
++
++constexpr base::TimeDelta kColorFade = base::Milliseconds(200);
+ const char kPageTopSampleKey[] = "biba-page-top-sample";
+ 
+ PageTopSample* GetSample(content::WebContents* contents, bool create) {
+@@ -386,8 +393,22 @@
+   if (!browser_view || !browser_view->GetIsNormalType()) {
+     return std::nullopt;
+   }
+-  return PageTopColor(
+-      const_cast<BrowserView*>(browser_view)->GetActiveWebContents());
++  content::WebContents* contents =
++      const_cast<BrowserView*>(browser_view)->GetActiveWebContents();
++  std::optional<SkColor> color = PageTopColor(contents);
++  // Mid cross-fade: blend from the previous colour.
++  if (PageTopSample* sample = contents ? GetSample(contents, false) : nullptr;
++      color && sample && sample->fade_from) {
++    const double t = (base::TimeTicks::Now() - sample->fade_start) /
++                     kColorFade;
++    if (t < 1.0) {
++      color = color_utils::AlphaBlend(
++          *color, *sample->fade_from,
++          static_cast<float>(gfx::Tween::CalculateValue(
++              gfx::Tween::EASE_OUT, t)));
++    }
++  }
++  return color;
+ }
+ 
+ void MatchToolbarToPage(views::View* location_bar,
+@@ -426,8 +447,29 @@
+     PageTopSample* sample = GetSample(contents, /*create=*/true);
+     const std::optional<SkColor> now_color = PageTopColor(contents);
+     if (sample->applied != now_color) {
++      // Fade only between two page colours; the first colour of a page
++      // (or a tab switch) shows at once.
++      sample->fade_from =
++          sample->applied && now_color ? sample->applied : std::nullopt;
++      sample->fade_start = base::TimeTicks::Now();
+       sample->applied = now_color;
+       changed = true;
++      if (sample->fade_from) {
++        // Repaint through the fade (about one frame apart).
++        auto tracker = std::make_shared<views::ViewTracker>(toolbar);
++        for (int i = 1; i <= 13; ++i) {
++          base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++              FROM_HERE,
++              base::BindOnce(
++                  [](std::shared_ptr<views::ViewTracker> tracker) {
++                    if (views::View* view = tracker->view()) {
++                      view->SchedulePaint();
++                    }
++                  },
++                  tracker),
++              base::Milliseconds(16 * i));
++        }
++      }
+     }
+   }
+   if (changed) {
+--- a/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
+@@ -442,6 +442,42 @@
+   target_index = target_index - num_dragged_tabs_before_target;
+   target_index = std::clamp(target_index, 0, tab_strip_model_->count() - 1);
+ 
++  // Biba (Dia): entering the pinned tiles pins the dragged tabs on the fly
++  // (they morph into tiles); entering the list unpins them again.
++  if (node.type() == TabCollectionNode::Type::PINNED ||
++      node.type() == TabCollectionNode::Type::UNPINNED) {
++    const bool pin = node.type() == TabCollectionNode::Type::PINNED;
++    for (const TabDragData& tab_drag_data : drag_session_data.tab_drag_data_) {
++      const content::WebContents* contents = tab_drag_data.contents;
++      const int index =
++          contents ? tab_strip_model_->GetIndexOfWebContents(contents)
++                   : TabStripModel::kNoTab;
++      if (index != TabStripModel::kNoTab &&
++          tab_strip_model_->IsTabPinned(index) != pin &&
++          !tab_strip_model_->GetTabGroupForTab(index) &&
++          !tab_strip_model_->GetTabAtIndex(index)->IsSplit()) {
++        tab_strip_model_->SetTabPinned(index, pin);
++      }
++    }
++    // The tabs now live in new nodes (and views) in the other container;
++    // point the drag session at them.
++    auto& session = const_cast<DragSessionData&>(drag_session_data);
++    for (TabDragData& tab_drag_data : session.tab_drag_data_) {
++      if (!tab_drag_data.contents) {
++        continue;
++      }
++      tabs::TabInterface* tab =
++          tabs::TabInterface::GetFromContents(tab_drag_data.contents);
++      TabCollectionNode* tab_node =
++          tab ? root_node_->GetNodeForHandle(tab->GetHandle()) : nullptr;
++      if (tab_node && tab_node->view()) {
++        tab_drag_data.attached_view = &GetOrCreateSlotViewForNode(*tab_node);
++        tab_drag_data.pinned = pin;
++      }
++    }
++    return;
++  }
++
+   tab_strip_model_->MoveSelectedTabsTo(target_index, target_group_id);
+ }
+ 
+@@ -465,10 +501,24 @@
+   }
+   for (TabSlotView* slot_view :
+        drag_controller_->GetSessionData().attached_views()) {
++    // Biba: while a dragged tab is pinned/unpinned on the fly, its old view
++    // (and slot view) go away before the session is pointed at the new one.
++    if (!IsLiveSlotView(slot_view)) {
++      continue;
++    }
+     if (&view == ViewFromTabSlot(slot_view)) {
+       return true;
+     }
+   }
++  return false;
++}
++
++bool TabDragHandlerImpl::IsLiveSlotView(const TabSlotView* slot_view) const {
++  for (const auto& [node, live] : slot_views_) {
++    if (live == slot_view) {
++      return true;
++    }
++  }
+   return false;
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
++++ b/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
+@@ -143,6 +143,8 @@
+   bool IsDraggingPinnedTabs() const override;
+   bool IsDraggingGroups() const override;
+   views::View* ViewFromTabSlot(TabSlotView* view) const override;
++  // Biba: whether `slot_view` is one this handler still owns.
++  bool IsLiveSlotView(const TabSlotView* slot_view) const;
+   std::optional<gfx::Vector2d> GetOffsetFromSourceAtDragStart(
+       views::View* view) const override;
+   std::optional<BrowserRootView::DropIndex> GetLinkDropIndexForNode(

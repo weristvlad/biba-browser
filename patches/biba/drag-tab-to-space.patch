@@ -1,0 +1,232 @@
+--- a/chrome/browser/ui/browser_command_controller.h
++++ b/chrome/browser/ui/browser_command_controller.h
+@@ -46,6 +46,10 @@
+ 
+ class BibaSpacesController;
+ 
++namespace gfx {
++class Point;
++}  // namespace gfx
++
+ namespace chrome {
+ 
+ // This class needs to expose the internal command_updater_ in some way, hence
+@@ -146,6 +150,17 @@
+   // Biba: moves the unpinned tabs at `indices` to Space `space` (-1: the
+   // first unused Space). The tabs are parked there, frozen.
+   void BibaMoveTabsToSpace(const std::vector<int>& indices, int space);
++  // Biba: drag a tab onto a Space dot. The sidebar's dots register a hit test
++  // (screen point -> Space index, or -1); while a tab drag is in progress the
++  // drag controller asks it, which also lets the dots highlight the target.
++  using BibaSpaceHitTest = base::RepeatingCallback<int(const gfx::Point&)>;
++  void BibaSetSpaceHitTest(BibaSpaceHitTest hit_test) {
++    biba_space_hit_test_ = std::move(hit_test);
++  }
++  int BibaSpaceAtScreenPoint(const gfx::Point& point_in_screen) const {
++    return biba_space_hit_test_ ? biba_space_hit_test_.Run(point_in_screen)
++                                : -1;
++  }
+   // Biba: titles + favicons of a parked Space (empty for the visible one).
+   std::vector<std::pair<std::u16string, gfx::Image>> biba_space_preview(
+       int index) const;
+@@ -331,6 +346,7 @@
+   int biba_frame_blend_space_ = -1;
+   float biba_frame_blend_amount_ = 0.0f;
+   int biba_last_space_ = 0;
++  BibaSpaceHitTest biba_space_hit_test_;
+   // Addresses only, never dereferenced: matched against the live view tree.
+   std::set<uintptr_t> biba_frame_painters_;
+   std::unique_ptr<BibaSpacesController> biba_spaces_;
+--- a/chrome/browser/ui/views/tabs/dragging/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/dragging/BUILD.gn
+@@ -60,6 +60,7 @@
+     ":dragging",
+     "//base",
+     "//chrome/browser/tab_group_sync:factories",
++    "//chrome/browser/ui:browser_command_controller",
+     "//chrome/browser/ui:browser_commands",
+     "//chrome/browser/ui:browser_element_identifiers",
+     "//chrome/browser/ui:browser_init_state",
+--- a/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
++++ b/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
+@@ -43,6 +43,8 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "base/task/sequenced_task_runner.h"
++#include "chrome/browser/ui/browser_command_controller.h"
+ #include "chrome/browser/ui/views/omnibox/omnibox_popup_presenter_base.h"
+ #include "chrome/browser/ui/views/tabs/dragging/drag_session_data.h"
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_context.h"
+@@ -121,6 +123,20 @@
+ 
+ namespace {
+ 
++// Biba: Space dot under `point_in_screen` in `context`'s window, or -1.
++int BibaSpaceAt(TabDragContext* context, const gfx::Point& point_in_screen) {
++  if (!context || !context->GetWidget()) {
++    return -1;
++  }
++  BrowserView* browser_view = BrowserView::GetBrowserViewForNativeWindow(
++      context->GetWidget()->GetNativeWindow());
++  auto* commands =
++      browser_view
++          ? chrome::BrowserCommandController::From(browser_view->browser())
++          : nullptr;
++  return commands ? commands->BibaSpaceAtScreenPoint(point_in_screen) : -1;
++}
++
+ // A dragged window is forced to be a bit smaller than maximized bounds during a
+ // drag. This prevents the dragged browser widget from getting maximized at
+ // creation and makes it easier to drag tabs out of a restored window that had
+@@ -1069,6 +1085,8 @@
+   last_point_in_screen_ = point_in_screen;
+ 
+   DCHECK(attached_context_);
++  // Biba: let the sidebar's Space dots highlight a drop target.
++  BibaSpaceAt(attached_context_.get(), point_in_screen);
+ 
+   TabDragContext* target_context = source_context_;
+   if (detach_behavior_ == DetachBehavior::kDetachable) {
+@@ -2067,6 +2085,55 @@
+   VLOG(1) << __func__ << " type=" << static_cast<int>(type)
+           << " state=" << static_cast<int>(current_state_);
+ 
++  // Biba: tabs dropped on a Space dot move to that Space once the drag has
++  // fully finished (they first land back in the list as usual).
++  if (attached_context_) {
++    const int target_space =
++        type == EndDragType::kNormal &&
++                current_state_ == DragState::kDraggingTabs
++            ? BibaSpaceAt(attached_context_.get(), last_point_in_screen_)
++            : -1;
++    // Clear the dots' highlight.
++    BibaSpaceAt(attached_context_.get(), gfx::Point(-100000, -100000));
++    BrowserView* browser_view = BrowserView::GetBrowserViewForNativeWindow(
++        attached_context_->GetWidget()->GetNativeWindow());
++    if (target_space >= 0 && browser_view) {
++      std::vector<base::WeakPtr<content::WebContents>> moved;
++      for (const TabDragData& data : drag_data_.tab_drag_data_) {
++        if (data.contents) {
++          moved.push_back(data.contents->GetWeakPtr());
++        }
++      }
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE,
++          base::BindOnce(
++              [](base::WeakPtr<BrowserWindowInterface> browser,
++                 std::vector<base::WeakPtr<content::WebContents>> moved,
++                 int space) {
++                if (!browser) {
++                  return;
++                }
++                TabStripModel* model = browser->GetTabStripModel();
++                std::vector<int> indices;
++                for (const auto& contents : moved) {
++                  const int index =
++                      contents ? model->GetIndexOfWebContents(contents.get())
++                               : TabStripModel::kNoTab;
++                  if (index != TabStripModel::kNoTab) {
++                    indices.push_back(index);
++                  }
++                }
++                if (auto* commands =
++                        chrome::BrowserCommandController::From(browser.get());
++                    commands && !indices.empty()) {
++                  commands->BibaMoveTabsToSpace(indices, space);
++                }
++              },
++              browser_view->browser()->GetWeakPtr(), std::move(moved),
++              target_space));
++    }
++  }
++
+   base::WeakPtr<TabDragController> ref(weak_factory_.GetWeakPtr());
+   DragState previous_state = current_state_;
+   current_state_ = DragState::kStopped;
+--- a/chrome/browser/ui/views/tabs/vertical/biba_space_switcher_view.cc
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_switcher_view.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/views/tabs/vertical/biba_space_switcher_view.h"
+ 
++#include "base/functional/bind.h"
++
+ #include <vector>
+ 
+ #include "cc/paint/paint_flags.h"
+@@ -34,9 +36,42 @@
+     : browser_(browser) {
+   GetViewAccessibility().SetRole(ax::mojom::Role::kTabList);
+   GetViewAccessibility().SetName(u"Spaces");
++  if (auto* commands = chrome::BrowserCommandController::From(browser_)) {
++    commands->BibaSetSpaceHitTest(base::BindRepeating(
++        &BibaSpaceSwitcherView::HitTestForDrag, base::Unretained(this)));
++  }
++}
++
++BibaSpaceSwitcherView::~BibaSpaceSwitcherView() {
++  if (auto* commands = chrome::BrowserCommandController::From(browser_)) {
++    commands->BibaSetSpaceHitTest({});
++  }
+ }
+ 
+-BibaSpaceSwitcherView::~BibaSpaceSwitcherView() = default;
++int BibaSpaceSwitcherView::HitTestForDrag(const gfx::Point& point_in_screen) {
++  int hit = -1;
++  if (GetVisible() && GetWidget()) {
++    gfx::Point point = point_in_screen;
++    views::View::ConvertPointFromScreen(this, &point);
++    // A generous target: the whole row, plus some room above and below.
++    gfx::Rect target = GetLocalBounds();
++    target.Inset(gfx::Insets::VH(-kCellSize / 2, 0));
++    if (target.Contains(point)) {
++      const std::vector<int> spaces = VisibleSpaces();
++      const int first = FirstCellX(spaces.size());
++      const int cell = (point.x() - first) / kCellSize;
++      if (point.x() >= first && cell >= 0 &&
++          cell < static_cast<int>(spaces.size())) {
++        hit = spaces[cell];
++      }
++    }
++  }
++  if (hit != drag_hover_space_) {
++    drag_hover_space_ = hit;
++    SchedulePaint();
++  }
++  return hit;
++}
+ 
+ gfx::Size BibaSpaceSwitcherView::CalculatePreferredSize(
+     const views::SizeBounds& available_size) const {
+@@ -69,6 +104,15 @@
+   int x = FirstCellX(spaces.size());
+   for (int space : spaces) {
+     const gfx::PointF center(x + kCellSize / 2.0f, height() / 2.0f);
++    if (space == drag_hover_space_ && space != active) {
++      // A tab is being dragged here: a ring in the Space's colour.
++      cc::PaintFlags ring;
++      ring.setAntiAlias(true);
++      ring.setStyle(cc::PaintFlags::kStroke_Style);
++      ring.setStrokeWidth(1.5f);
++      ring.setColor(biba::SpaceAccentColor(space));
++      canvas->DrawCircle(center, kCellSize / 2.0f - 3.0f, ring);
++    }
+     if (space == active) {
+       // Lift the accent a little so the dot reads on its own tinted frame.
+       flags.setColor(color_utils::BlendTowardMaxContrast(
+--- a/chrome/browser/ui/views/tabs/vertical/biba_space_switcher_view.h
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_switcher_view.h
+@@ -35,6 +35,12 @@
+   std::vector<int> VisibleSpaces() const;
+   // Left edge of the first dot cell, so the row is centred.
+   int FirstCellX(size_t count) const;
++  // Space under `point_in_screen` for a tab being dragged (-1 for none), and
++  // remembers it so the dot can be highlighted.
++  int HitTestForDrag(const gfx::Point& point_in_screen);
++
++  // Space a dragged tab hovers over, highlighted; -1 when none.
++  int drag_hover_space_ = -1;
+ 
+   raw_ptr<BrowserWindowInterface> browser_;
+ };

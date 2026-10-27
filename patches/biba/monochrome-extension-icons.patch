@@ -1,0 +1,115 @@
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <memory>
+ 
++#include "chrome/browser/ui/biba/biba_prefs.h"
+ #include "ash/constants/ash_pref_names.h"
+ #include "ash/constants/ash_switches.h"
+ #include "build/branding_buildflags.h"
+@@ -228,6 +229,8 @@
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kHeliumShowProgressBar] =
+       settings_api::PrefType::kBoolean;
++  (*s_allowlist)[biba::prefs::kMonochromeExtensionIcons] =
++      settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kHeliumZenMode] = settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kHeliumZenModeSidebarPinned] =
+       settings_api::PrefType::kBoolean;
+--- a/chrome/browser/resources/settings/appearance_page/appearance_layout_page.html.ts
++++ b/chrome/browser/resources/settings/appearance_page/appearance_layout_page.html.ts
+@@ -58,6 +58,11 @@
+       label="$i18n{showProgressBar}">
+   </settings-toggle-button>
+   <settings-toggle-button class="hr"
++      pref-key="biba.appearance.monochrome_extension_icons"
++      label="Monochrome extension icons"
++      sub-label="Show pinned extensions in grey, like the rest of the toolbar">
++  </settings-toggle-button>
++  <settings-toggle-button class="hr"
+       pref-key="helium.browser.zen_mode"
+       label="$i18n{browserZenMode}"
+       sub-label="$i18n{browserZenModeDescription}">
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -655,6 +655,7 @@
+     sources = [
+       "biba/biba_spaces_controller.cc",
+       "biba/biba_spaces_controller.h",
++      "biba/biba_prefs.h",
+       "browser_command_controller.cc",
+     ]
+     public_deps = [
+--- /dev/null
++++ b/chrome/browser/ui/biba/biba_prefs.h
+@@ -0,0 +1,17 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_BIBA_BIBA_PREFS_H_
++#define CHROME_BROWSER_UI_BIBA_BIBA_PREFS_H_
++
++namespace biba::prefs {
++
++// Boolean: draw pinned extension icons in the toolbar without colour, so they
++// sit quietly next to Biba's monochrome toolbar icons (Settings > Appearance).
++inline constexpr char kMonochromeExtensionIcons[] =
++    "biba.appearance.monochrome_extension_icons";
++
++}  // namespace biba::prefs
++
++#endif  // CHROME_BROWSER_UI_BIBA_BIBA_PREFS_H_
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -7,6 +7,7 @@
+ #include <memory>
+ #include <string>
+ 
++#include "chrome/browser/ui/biba/biba_prefs.h"
+ #include "base/numerics/safe_conversions.h"
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
+@@ -142,6 +143,7 @@
+   registry->RegisterBooleanPref(prefs::kHeliumMinimalLocationBar, true);  // Biba
+ 
+   registry->RegisterBooleanPref(prefs::kHeliumShowProgressBar, true);
++  registry->RegisterBooleanPref(biba::prefs::kMonochromeExtensionIcons, true);
+ 
+   registry->RegisterBooleanPref(prefs::kHomePageIsNewTabPage, true,
+                                 pref_registration_flags);
+--- a/chrome/browser/ui/views/toolbar/toolbar_action_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_action_view.cc
+@@ -3,6 +3,11 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/ui/views/toolbar/toolbar_action_view.h"
++#include "ui/gfx/image/image_skia_operations.h"
++#include "ui/gfx/color_utils.h"
++#include "components/prefs/pref_service.h"
++#include "chrome/browser/ui/biba/biba_prefs.h"
++#include "chrome/browser/profiles/profile.h"
+ 
+ #include <string>
+ 
+@@ -201,6 +206,19 @@
+   }
+ 
+   ui::ImageModel icon = view_model_->GetIcon(web_contents, GetPreferredSize());
++  // Biba: optionally drain the colour from extension icons (Appearance
++  // setting), keeping their shapes and shading.
++  if (icon.IsImage() && web_contents) {
++    const PrefService* prefs =
++        Profile::FromBrowserContext(web_contents->GetBrowserContext())
++            ->GetPrefs();
++    if (prefs->GetBoolean(biba::prefs::kMonochromeExtensionIcons)) {
++      const color_utils::HSL desaturate = {-1, 0, -1};
++      icon = ui::ImageModel::FromImageSkia(
++          gfx::ImageSkiaOperations::CreateHSLShiftedImage(
++              icon.GetImage().AsImageSkia(), desaturate));
++    }
++  }
+   if (!icon.IsEmpty()) {
+     SetImageModel(views::Button::STATE_NORMAL, icon);
+     SetImageModel(views::Button::STATE_DISABLED,

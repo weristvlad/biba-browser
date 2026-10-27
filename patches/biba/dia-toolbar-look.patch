@@ -1,0 +1,427 @@
+--- a/chrome/browser/ui/layout_constants.cc
++++ b/chrome/browser/ui/layout_constants.cc
+@@ -136,7 +136,7 @@
+       return 1;
+     case LayoutConstant::kToolbarElementPadding:
+       // Biba (Dia): more air between toolbar buttons.
+-      return touch_ui ? 0 : 6;
++      return touch_ui ? 0 : 8;
+     case LayoutConstant::kToolbarIconDefaultMargin:
+       return touch_ui ? 0 : GetLayoutConstant(LayoutConstant::kHeliumBasePadding);
+     case LayoutConstant::kToolbarButtonRefreshExpandedMargin:
+@@ -239,10 +239,9 @@
+         return gfx::Insets::TLBR(4, 5, 4, 4);
+       }
+ 
+-    case TOOLBAR_INTERIOR_MARGIN: {
+-      const int base = GetLayoutConstant(LayoutConstant::kHeliumBasePadding);
+-      return gfx::Insets::VH(base, base * 2);
+-    }
++    case TOOLBAR_INTERIOR_MARGIN:
++      // Biba (Dia): a 40pt toolbar with roomy ends.
++      return gfx::Insets::TLBR(6, 10, 6, 8);
+ 
+     case WEBUI_TAB_STRIP_TOOLBAR_INTERIOR_MARGIN:
+       return gfx::Insets::VH(4, 0);
+--- a/chrome/browser/ui/views/frame/biba_frame_paint.cc
++++ b/chrome/browser/ui/views/frame/biba_frame_paint.cc
+@@ -19,6 +19,7 @@
+ #include "ui/gfx/skia_paint_util.h"
+ #include "content/public/browser/web_contents.h"
+ #include "chrome/browser/ui/views/frame/top_container_view.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+ #include "chrome/browser/ui/views/frame/multi_contents_view.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+@@ -61,8 +62,9 @@
+ // Accent share at the gradient's two ends (top-left, bottom-right).
+ constexpr float kTintStartDark = 0.42f;
+ constexpr float kTintEndDark = 0.20f;
+-constexpr float kTintStartLight = 0.32f;
+-constexpr float kTintEndLight = 0.16f;
++// Dia keeps the sidebar a soft, greyish tint of the colour.
++constexpr float kTintStartLight = 0.22f;
++constexpr float kTintEndLight = 0.12f;
+ 
+ // Rotates `color`'s hue by `degrees` (analogous companion for the gradient).
+ SkColor RotateHue(SkColor color, double degrees) {
+@@ -118,12 +120,16 @@
+       !browser_view->multi_contents_view()->GetVisible()) {
+     return;
+   }
+-  gfx::Rect card = browser_view->top_container()->GetBoundsInScreen();
++  // The card is the toolbar plus the page below it.
++  gfx::Rect card = browser_view->toolbar() &&
++                           browser_view->toolbar()->GetVisible()
++                       ? browser_view->toolbar()->GetBoundsInScreen()
++                       : browser_view->top_container()->GetBoundsInScreen();
+   card.Union(browser_view->multi_contents_view()->GetBoundsInScreen());
+   // The page area inside MultiContentsView is inset; the card is what's
+   // visible: take its inner edges.
+   card.Inset(gfx::Insets::TLBR(0, 0, MultiContentsView::kSplitViewContentInset,
+-                               0));
++                               MultiContentsView::kSplitViewContentInset));
+   const gfx::Point view_origin = view->GetBoundsInScreen().origin();
+   card.Offset(-view_origin.x(), -view_origin.y());
+   if (!gfx::Rect(view->size()).Intersects(
+@@ -185,7 +191,9 @@
+   }
+ 
+   const bool dark = color_utils::IsDark(
+-      view->GetColorProvider()->GetColor(ui::kColorSysSurface));
++      // The window's colours, not `view`'s: a toolbar over a dark page has
++      // its own dark palette, but the frame behind its corners doesn't.
++      view->GetWidget()->GetColorProvider()->GetColor(ui::kColorSysSurface));
+   const SkColor base = dark ? kDarkBase : kLightBase;
+   const SkColor start = color_utils::AlphaBlend(
+       accent, base, dark ? kTintStartDark : kTintStartLight);
+--- a/chrome/browser/ui/views/frame/themed_background.cc
++++ b/chrome/browser/ui/views/frame/themed_background.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/views/frame/themed_background.h"
+ 
++#include "ui/gfx/color_utils.h"
++
+ #include <string_view>
+ 
+ #include "chrome/browser/ui/views/frame/biba_frame_paint.h"
+@@ -127,6 +129,11 @@
+     if (const std::optional<SkColor> site =
+             biba::SiteToolbarColor(view, browser_view)) {
+       canvas->DrawColor(*site);
++      // Dia: a hairline between the toolbar and the page.
++      const bool dark = color_utils::IsDark(*site);
++      canvas->FillRect(gfx::Rect(0, view->height() - 1, view->width(), 1),
++                       SkColorSetA(dark ? SK_ColorWHITE : SK_ColorBLACK,
++                                   dark ? 0x1A : 0x12));
+       return;
+     }
+   }
+--- a/chrome/browser/ui/views/tabs/vertical/biba_space_menu_button.cc
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_menu_button.cc
+@@ -112,9 +112,9 @@
+                     color_utils::IsDark(
+                         GetColorProvider()->GetColor(ui::kColorSysSurface));
+   const SkColor text_color = color_utils::AlphaBlend(
+-      accent, dark ? SK_ColorWHITE : SK_ColorBLACK, dark ? 0.55f : 0.6f);
+-  const gfx::FontList font = gfx::FontList().DeriveWithSizeDelta(2).DeriveWithWeight(
+-      gfx::Font::Weight::SEMIBOLD);
++      accent, dark ? SK_ColorWHITE : SK_ColorBLACK, dark ? 0.6f : 0.5f);
++  const gfx::FontList font = gfx::FontList().DeriveWithSizeDelta(1).DeriveWithWeight(
++      gfx::Font::Weight::MEDIUM);
+   auto source = std::make_unique<NameSource>(
+       u"Space " + base::NumberToString16(active + 1), font, text_color);
+   const gfx::Size size = source->size();
+--- a/chrome/browser/ui/views/toolbar/back_forward_button.cc
++++ b/chrome/browser/ui/views/toolbar/back_forward_button.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/views/toolbar/back_forward_button.h"
+ 
++#include "ui/views/vector_icons.h"
++
+ #include "base/metrics/user_metrics.h"
+ #include "base/time/time.h"
+ #include "chrome/app/vector_icons/vector_icons.h"
+@@ -46,12 +48,8 @@
+   SetTriggerableEventFlags(ui::EF_LEFT_MOUSE_BUTTON |
+                            ui::EF_MIDDLE_MOUSE_BUTTON);
+   if (direction == Direction::kBack) {
+-    SetVectorIcons(features::IsRoundedIconsEnabled()
+-                       ? vector_icons::kArrowBackIcon
+-                       : vector_icons::kBackArrowChromeRefreshOldIcon,
+-                   features::IsRoundedIconsEnabled()
+-                       ? vector_icons::kArrowBackIcon
+-                       : kBackArrowTouchOldIcon);
++    // Biba (Dia): thin chevrons.
++    SetVectorIcons(views::kBibaChevronLeftIcon, views::kBibaChevronLeftIcon);
+     SetTooltipText(l10n_util::GetStringUTF16(IDS_TOOLTIP_BACK));
+     GetViewAccessibility().SetName(l10n_util::GetStringUTF16(IDS_ACCNAME_BACK));
+     GetViewAccessibility().SetDescription(
+@@ -60,12 +58,7 @@
+     SetProperty(views::kElementIdentifierKey, kToolbarBackButtonElementId);
+     set_menu_identifier(kToolbarBackButtonMenuElementId);
+   } else {
+-    SetVectorIcons(features::IsRoundedIconsEnabled()
+-                       ? vector_icons::kArrowForwardIcon
+-                       : vector_icons::kForwardArrowChromeRefreshOldIcon,
+-                   features::IsRoundedIconsEnabled()
+-                       ? vector_icons::kArrowForwardIcon
+-                       : kForwardArrowTouchOldIcon);
++    SetVectorIcons(views::kBibaChevronRightIcon, views::kBibaChevronRightIcon);
+     SetTooltipText(l10n_util::GetStringUTF16(IDS_TOOLTIP_FORWARD));
+     GetViewAccessibility().SetName(
+         l10n_util::GetStringUTF16(IDS_ACCNAME_FORWARD));
+--- a/chrome/browser/ui/views/toolbar/reload_button.cc
++++ b/chrome/browser/ui/views/toolbar/reload_button.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/views/toolbar/reload_button.h"
+ 
++#include "ui/views/vector_icons.h"
++
+ #include <stddef.h>
+ 
+ #include "base/strings/utf_string_conversions.h"
+@@ -65,12 +67,9 @@
+                     nullptr),
+       metrics_recorder_(std::make_unique<WaapUIMetricsRecorder>(profile)),
+       command_updater_(command_updater),
+-      reload_icon_(features::IsRoundedIconsEnabled()
+-                       ? vector_icons::kRefreshIcon
+-                       : vector_icons::kReloadChromeRefreshOldIcon),
+-      reload_touch_icon_(features::IsRoundedIconsEnabled()
+-                             ? vector_icons::kRefreshIcon
+-                             : kReloadTouchOldIcon),
++      // Biba (Dia): thin clockwise arrow.
++      reload_icon_(views::kBibaReloadIcon),
++      reload_touch_icon_(views::kBibaReloadIcon),
+       stop_icon_(features::IsRoundedIconsEnabled()
+                      ? kCloseIcon
+                      : kNavigateStopChromeRefreshOldIcon),
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -2358,9 +2358,10 @@
+   }
+ 
+   // ToolbarButton mirrors the icon in RTL.
++  // Biba (Dia): thin sidebar outline.
+   const gfx::VectorIcon& icon = controller->IsTabStripRightAligned()
+                                     ? views::kSidebarRightIcon
+-                                    : views::kSidebarLeftIcon;
++                                    : views::kBibaSidebarIcon;
+   const int text_id = controller->IsCollapsed() ? IDS_EXPAND_VERTICAL_TABS
+                                                 : IDS_COLLAPSE_VERTICAL_TABS;
+   const std::u16string text = l10n_util::GetStringUTF16(text_id);
+--- a/ui/views/BUILD.gn
++++ b/ui/views/BUILD.gn
+@@ -79,6 +79,10 @@
+     "radio_button_checked.icon",
+     "radio_button_normal_old.icon",
+     "sidebar_left.icon",
++    "biba_chevron_left.icon",
++    "biba_chevron_right.icon",
++    "biba_reload.icon",
++    "biba_sidebar.icon",
+     "sidebar_right.icon",
+     "tab.icon",
+     "uninstall_old.icon",
+--- /dev/null
++++ b/ui/views/vector_icons/biba_chevron_left.icon
+@@ -0,0 +1,10 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// Thin "back" chevron (Dia / SF Symbols weight).
++CANVAS_DIMENSIONS, 20,
++STROKE, 1.6f,
++MOVE_TO, 12.5f, 4.5f,
++LINE_TO, 7, 10,
++LINE_TO, 12.5f, 15.5f
+--- /dev/null
++++ b/ui/views/vector_icons/biba_chevron_right.icon
+@@ -0,0 +1,10 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// Thin "forward" chevron (Dia / SF Symbols weight).
++CANVAS_DIMENSIONS, 20,
++STROKE, 1.6f,
++MOVE_TO, 7.5f, 4.5f,
++LINE_TO, 13, 10,
++LINE_TO, 7.5f, 15.5f
+--- /dev/null
++++ b/ui/views/vector_icons/biba_reload.icon
+@@ -0,0 +1,12 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// Thin clockwise arrow (Dia / SF Symbols weight).
++CANVAS_DIMENSIONS, 20,
++STROKE, 1.5f,
++MOVE_TO, 15.6f, 8.1f,
++ARC_TO, 6, 6, 0, 1, 1, 10, 4.5f,
++MOVE_TO, 8.2f, 2.4f,
++LINE_TO, 10.3f, 4.5f,
++LINE_TO, 8.2f, 6.6f
+--- /dev/null
++++ b/ui/views/vector_icons/biba_sidebar.icon
+@@ -0,0 +1,10 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// Thin sidebar outline (Dia / SF Symbols weight).
++CANVAS_DIMENSIONS, 20,
++STROKE, 1.4f,
++ROUND_RECT, 3, 4.5f, 14, 11, 2.5f,
++MOVE_TO, 8, 4.5f,
++LINE_TO, 8, 15.5f
+--- a/chrome/browser/ui/views/frame/contents_container_view.cc
++++ b/chrome/browser/ui/views/frame/contents_container_view.cc
+@@ -204,7 +204,7 @@
+   const bool split_changed = is_in_split != is_in_split_;
+   const bool rounded_contents_changed =
+       should_round_contents != should_round_contents_;
+-  const bool corner_state_changed =
++  bool corner_state_changed =
+       round_top_left_window_corner_ != round_top_left ||
+       round_top_right_window_corner_ != round_top_right ||
+       round_bottom_left_window_corner_ != round_bottom_left ||
+@@ -240,6 +240,17 @@
+                             ContentsContainerOutline::kThickness)));
+       }
+     }
++    // Biba: whether the sidebar is vertical can change after the border was
++    // first chosen (it isn't known yet at startup); keep it in sync.
++    if (!is_in_split) {
++      const bool want_border = !browser_view_->ShouldDrawVerticalTabStrip();
++      if (want_border != !!GetBorder()) {
++        SetBorder(want_border ? views::CreateEmptyBorder(gfx::Insets(
++                                    ContentsContainerOutline::kThickness))
++                              : nullptr);
++        corner_state_changed = true;
++      }
++    }
+     if (split_changed || rounded_contents_changed || corner_state_changed) {
+       UpdateBorderRoundedCorners();
+     }
+@@ -353,10 +364,19 @@
+       round_bottom_left_window_corner_ ? frame_radius : generic_radius;
+   const int lower_right_radius =
+       round_bottom_right_window_corner_ ? frame_radius : generic_radius;
++  // Biba (Dia): with the sidebar the page hangs straight off the toolbar;
++  // only the card's outer corners are rounded.
++  const bool square_top = browser_view_->ShouldDrawVerticalTabStrip() &&
++                          !round_top_left_window_corner_ &&
++                          !round_top_right_window_corner_;
+   const int upper_left_radius =
+-      round_top_left_window_corner_ ? frame_radius : generic_radius;
++      square_top ? 0
++                 : (round_top_left_window_corner_ ? frame_radius
++                                                  : generic_radius);
+   const int upper_right_radius =
+-      round_top_right_window_corner_ ? frame_radius : generic_radius;
++      square_top ? 0
++                 : (round_top_right_window_corner_ ? frame_radius
++                                                   : generic_radius);
+ 
+   const gfx::RoundedCornersF container_rounded_corners(
+       upper_left_radius, upper_right_radius, lower_right_radius,
+@@ -364,8 +384,10 @@
+   const int inner_padding = is_in_split_ ? kSplitViewContentPadding
+                                          : ContentsContainerOutline::kThickness;
+   const gfx::RoundedCornersF inner_rounded_corners(
+-      upper_left_radius - inner_padding, upper_right_radius - inner_padding,
+-      lower_right_radius - inner_padding, lower_left_radius - inner_padding);
++      std::max(0, upper_left_radius - inner_padding),
++      std::max(0, upper_right_radius - inner_padding),
++      std::max(0, lower_right_radius - inner_padding),
++      std::max(0, lower_left_radius - inner_padding));
+ 
+   container_outline_->SetCornerRadii(container_rounded_corners);
+   if (capture_contents_border_view_) {
+--- a/chrome/browser/ui/views/frame/multi_contents_background_view.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_background_view.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/views/frame/multi_contents_background_view.h"
+ 
++#include "chrome/browser/ui/views/frame/browser_view.h"
++
+ #include "chrome/browser/ui/views/frame/themed_background.h"
+ #include "chrome/browser/ui/views/helium/native_frame_materials.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+@@ -26,13 +28,22 @@
+ 
+ void MultiContentsBackgroundView::SetRoundedCorners(
+     const gfx::RoundedCornersF& radii) {
+-  layer()->SetRoundedCornerRadius(radii);
+-  layer()->SetIsFastRoundedCorner(!radii.IsEmpty());
++  // The page takes its corner radii from here; keep them even when this view
++  // itself isn't rounded.
++  radii_ = radii;
++  // Biba: with the sidebar this view is window frame around the page card;
++  // rounding it leaves a seam inside the window's own corner.
++  const gfx::RoundedCornersF layer_radii =
++      browser_view_ && browser_view_->ShouldDrawVerticalTabStrip()
++          ? gfx::RoundedCornersF()
++          : radii;
++  layer()->SetRoundedCornerRadius(layer_radii);
++  layer()->SetIsFastRoundedCorner(!layer_radii.IsEmpty());
+ }
+ 
+ const gfx::RoundedCornersF& MultiContentsBackgroundView::GetRoundedCorners()
+     const {
+-  return layer()->rounded_corner_radii();
++  return radii_;
+ }
+ 
+ void MultiContentsBackgroundView::OnThemeChanged() {
+--- a/chrome/browser/ui/views/frame/multi_contents_background_view.h
++++ b/chrome/browser/ui/views/frame/multi_contents_background_view.h
+@@ -5,13 +5,10 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_FRAME_MULTI_CONTENTS_BACKGROUND_VIEW_H_
+ #define CHROME_BROWSER_UI_VIEWS_FRAME_MULTI_CONTENTS_BACKGROUND_VIEW_H_
+ 
++#include "ui/gfx/geometry/rounded_corners_f.h"
+ #include "ui/views/view.h"
+ class BrowserView;
+ 
+-namespace gfx {
+-class RoundedCornersF;
+-}  // namespace gfx
+-
+ // MultiContentsBackgroundView prioritizes using a `ui::LAYER_SOLID_COLOR` for
+ // background painting whenever possible (or `ui::LAYER_TEXTURED`). This method
+ // is more efficient than painting directly onto the widget's texture layer.
+@@ -39,6 +36,9 @@
+   void UpdateSolidLayerColor();
+ 
+   const raw_ptr<BrowserView> browser_view_;
++
++  // Biba: radii handed to the page (see SetRoundedCorners()).
++  gfx::RoundedCornersF radii_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_FRAME_MULTI_CONTENTS_BACKGROUND_VIEW_H_
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -1309,18 +1309,26 @@
+       IsParentedTo(views().top_container, views().browser_view)) {
+     auto& top_container_layout =
+         layout.AddChild(views().top_container, gfx::Rect());
+-    const gfx::Rect top_container_local_bounds = CalculateTopContainerLayout(
+-        top_container_layout,
+-        params.InLocalCoordinates(params.visual_client_area), needs_exclusion);
+-    top_container_layout.bounds =
+-        GetTopContainerBoundsInParent(top_container_local_bounds, params);
++    auto top_container_area =
++        params.InLocalCoordinates(params.visual_client_area);
+     if (layout_data_->tab_strip_type == TabStripType::kVertical) {
+       // Biba (Dia): the toolbar is the top of the page card, inset from the
+-      // window edge like the rest of the card.
+-      top_container_layout.bounds.Inset(
++      // window edge like the rest of the card. Inset before laying out, so
++      // the toolbar is sized to the card (not clipped by it).
++      top_container_area.Inset(
+           gfx::Insets::TLBR(MultiContentsView::kSplitViewContentInset, 0, 0,
+                             MultiContentsView::kSplitViewContentInset));
+     }
++    const gfx::Rect top_container_local_bounds = CalculateTopContainerLayout(
++        top_container_layout, top_container_area, needs_exclusion);
++    top_container_layout.bounds =
++        GetTopContainerBoundsInParent(top_container_local_bounds, params);
++    if (layout_data_->tab_strip_type == TabStripType::kVertical) {
++      // The children were laid out in the inset area already; keep the
++      // container itself at the top so the inset isn't applied twice.
++      top_container_layout.bounds.Inset(gfx::Insets::TLBR(
++          -MultiContentsView::kSplitViewContentInset, 0, 0, 0));
++    }
+     params.SetTop(top_container_layout.bounds.bottom());
+   }
+ 

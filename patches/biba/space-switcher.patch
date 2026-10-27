@@ -1,0 +1,576 @@
+--- a/chrome/browser/ui/biba/biba_spaces_controller.h
++++ b/chrome/browser/ui/biba/biba_spaces_controller.h
+@@ -42,6 +42,12 @@
+ 
+   int active_space() const { return active_space_; }
+ 
++  // True for the visible Space and for Spaces that hold parked tabs.
++  bool IsSpaceInUse(int index) const {
++    return index == active_space_ ||
++           (index >= 0 && index < kMaxSpaces && !spaces_[index].items.empty());
++  }
++
+   // Called after the visible Space changed (e.g. to repaint the frame).
+   void set_on_space_changed(base::RepeatingClosure callback) {
+     on_space_changed_ = std::move(callback);
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -494,7 +494,24 @@
+   return biba_spaces_ ? biba_spaces_->active_space() : 0;
+ }
+ 
++base::CallbackListSubscription
++BrowserCommandController::BibaAddSpaceChangedCallback(
++    BibaSpaceChangedCallback callback) {
++  return biba_space_changed_callbacks_.Add(std::move(callback));
++}
++
++bool BrowserCommandController::biba_space_in_use(int index) const {
++  return biba_spaces_ ? biba_spaces_->IsSpaceInUse(index) : index == 0;
++}
++
+ void BrowserCommandController::RepaintBibaFrame() {
++  const int to = biba_active_space();
++  if (to != biba_last_space_) {
++    const int from = biba_last_space_;
++    biba_last_space_ = to;
++    biba_space_changed_callbacks_.Notify(from, to);
++  }
++
+   // The frame colour follows the active Space; repaint every frame surface.
+   views::Widget* widget =
+       browser_->GetWindow()
+@@ -897,6 +914,7 @@
+     case IDC_BIBA_SWITCH_SPACE_6:
+     case IDC_BIBA_SWITCH_SPACE_7:
+     case IDC_BIBA_SWITCH_SPACE_8:
++      LOG(ERROR) << "[biba-keys] switch space command " << id;
+       if (!biba_spaces_) {
+         biba_spaces_ = std::make_unique<BibaSpacesController>(
+             browser_->GetTabStripModel());
+--- a/chrome/browser/ui/browser_command_controller.h
++++ b/chrome/browser/ui/browser_command_controller.h
+@@ -6,6 +6,8 @@
+ #define CHROME_BROWSER_UI_BROWSER_COMMAND_CONTROLLER_H_
+ 
+ #include <memory>
++
++#include "base/callback_list.h"
+ #include <optional>
+ 
+ #include "base/containers/flat_map.h"
+@@ -126,6 +128,12 @@
+   // Biba: index of the Space shown in this window (0 when Spaces were never
+   // used).
+   int biba_active_space() const;
++  // Biba: whether Space `index` exists (visible or holding parked tabs).
++  bool biba_space_in_use(int index) const;
++  // Biba: notified after the visible Space changed, with (from, to) indices.
++  using BibaSpaceChangedCallback = base::RepeatingCallback<void(int, int)>;
++  base::CallbackListSubscription BibaAddSpaceChangedCallback(
++      BibaSpaceChangedCallback callback);
+ 
+  private:
+ #if BUILDFLAG(IS_CHROMEOS)
+@@ -300,6 +308,8 @@
+   void RepaintBibaFrame();
+ 
+   // Biba: Spaces of this window. Created on first use.
++  base::RepeatingCallbackList<void(int, int)> biba_space_changed_callbacks_;
++  int biba_last_space_ = 0;
+   std::unique_ptr<BibaSpacesController> biba_spaces_;
+ 
+   // The CommandUpdater that manages the browser window commands
+--- a/chrome/browser/ui/views/frame/biba_frame_paint.cc
++++ b/chrome/browser/ui/views/frame/biba_frame_paint.cc
+@@ -97,6 +97,10 @@
+ 
+ }  // namespace
+ 
++SkColor SpaceAccentColor(int index) {
++  return kSpaceAccents[static_cast<size_t>(index) % kSpaceAccents.size()];
++}
++
+ bool PaintSpaceFrame(gfx::Canvas* canvas,
+                      const views::View* view,
+                      const BrowserView* browser_view) {
+--- a/chrome/browser/ui/views/frame/biba_frame_paint.h
++++ b/chrome/browser/ui/views/frame/biba_frame_paint.h
+@@ -5,6 +5,8 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_FRAME_BIBA_FRAME_PAINT_H_
+ #define CHROME_BROWSER_UI_VIEWS_FRAME_BIBA_FRAME_PAINT_H_
+ 
++#include "third_party/skia/include/core/SkColor.h"
++
+ class BrowserView;
+ 
+ namespace gfx {
+@@ -26,6 +28,9 @@
+                      const views::View* view,
+                      const BrowserView* browser_view);
+ 
++// Accent colour of Space `index` (also used by the Space switcher dots).
++SkColor SpaceAccentColor(int index);
++
+ }  // namespace biba
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_FRAME_BIBA_FRAME_PAINT_H_
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -53,6 +53,8 @@
+ #include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h"
+ #include "chrome/browser/ui/views/tabs/organizer/organizer_panel_utils.h"
+ #include "chrome/browser/ui/views/tabs/shared/drop_arrow.h"
++#include "chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.h"
++#include "chrome/browser/ui/views/tabs/vertical/biba_space_switcher_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_focus_swipe_controller.h"
+ #include "chrome/browser/ui/web_applications/app_browser_controller.h"
+@@ -135,6 +137,10 @@
+   content_area_view_->SetPaintToLayer();
+   content_area_view_->layer()->SetFillsBoundsOpaquely(false);
+ 
++  biba_swipe_handler_ = std::make_unique<BibaSpaceSwipeHandler>(
++      browser_view->browser(), content_area_view_);
++  AddPreTargetHandler(biba_swipe_handler_.get());
++
+   // --------------
+   // Views that go into the content area below
+ 
+@@ -159,6 +165,14 @@
+   gemini_button_ =
+       content_area_view_->AddChildView(std::make_unique<views::View>());
+ 
++  // Biba: Space dots at the very bottom of the sidebar.
++  auto* space_switcher = content_area_view_->AddChildView(
++      std::make_unique<BibaSpaceSwitcherView>(browser_view->browser()));
++  space_switcher->SetProperty(
++      views::kMarginsKey,
++      gfx::Insets::TLBR(4, region_horizontal_padding, 6,
++                        region_horizontal_padding));
++
+   // Views that go into the content area above
+   // --------------
+ 
+@@ -201,6 +215,9 @@
+ }
+ 
+ VerticalTabStripRegionView::~VerticalTabStripRegionView() {
++  if (biba_swipe_handler_) {
++    RemovePreTargetHandler(biba_swipe_handler_.get());
++  }
+   for (const auto& lock : hover_locks_) {
+     lock->ClearRegionViewOnDestruction();
+   }
+--- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
+@@ -7,6 +7,8 @@
+ 
+ source_set("vertical") {
+   sources = [
++    "biba_space_swipe_handler.h",
++    "biba_space_switcher_view.h",
+     "top_container_button.h",
+     "vertical_new_tab_button.h",
+     "vertical_tab_strip_bottom_container.h",
+@@ -37,6 +39,8 @@
+ 
+ source_set("impl") {
+   sources = [
++    "biba_space_swipe_handler.cc",
++    "biba_space_switcher_view.cc",
+     "top_container_button.cc",
+     "vertical_new_tab_button.cc",
+     "vertical_tab_strip_bottom_container.cc",
+@@ -47,6 +51,13 @@
+   ]
+ 
+   deps = [
++    "//cc/paint",
++    "//chrome/app:command_ids",
++    "//chrome/browser/ui:browser_command_controller",
++    "//chrome/browser/ui/views/frame:biba_frame_paint",
++    "//ui/compositor",
++    "//ui/events",
++    "//ui/gfx",
+     "//chrome/browser:primitives",
+     "//chrome/browser/glic",
+     "//chrome/browser/glic/browser_ui:glow",
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_switcher_view.cc
+@@ -0,0 +1,99 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/vertical/biba_space_switcher_view.h"
++
++#include <vector>
++
++#include "cc/paint/paint_flags.h"
++#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/ui/browser_command_controller.h"
++#include "chrome/browser/ui/views/frame/biba_frame_paint.h"
++#include "ui/accessibility/ax_enums.mojom.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/events/event.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/color_utils.h"
++#include "ui/views/accessibility/view_accessibility.h"
++
++namespace {
++
++// Each dot sits in a 24x24 cell so it stays easy to hit even though the dot
++// itself is small.
++constexpr int kCellSize = 24;
++constexpr float kDotRadius = 3.0f;
++constexpr float kActiveDotRadius = 3.5f;
++constexpr int kMaxSpaces = 9;
++// Inactive dots: white at 35% over the tinted frame.
++constexpr SkAlpha kInactiveAlpha = 0x59;
++
++}  // namespace
++
++BibaSpaceSwitcherView::BibaSpaceSwitcherView(BrowserWindowInterface* browser)
++    : browser_(browser) {
++  GetViewAccessibility().SetRole(ax::mojom::Role::kTabList);
++  GetViewAccessibility().SetName(u"Spaces");
++}
++
++BibaSpaceSwitcherView::~BibaSpaceSwitcherView() = default;
++
++gfx::Size BibaSpaceSwitcherView::CalculatePreferredSize(
++    const views::SizeBounds& available_size) const {
++  return gfx::Size(kCellSize * static_cast<int>(VisibleSpaces().size()),
++                   kCellSize);
++}
++
++std::vector<int> BibaSpaceSwitcherView::VisibleSpaces() const {
++  std::vector<int> spaces;
++  const auto* commands = chrome::BrowserCommandController::From(browser_);
++  for (int i = 0; i < kMaxSpaces; ++i) {
++    if (commands ? commands->biba_space_in_use(i) : i == 0) {
++      spaces.push_back(i);
++    }
++  }
++  return spaces;
++}
++
++int BibaSpaceSwitcherView::FirstCellX(size_t count) const {
++  return (width() - kCellSize * static_cast<int>(count)) / 2;
++}
++
++void BibaSpaceSwitcherView::OnPaint(gfx::Canvas* canvas) {
++  const std::vector<int> spaces = VisibleSpaces();
++  const auto* commands = chrome::BrowserCommandController::From(browser_);
++  const int active = commands ? commands->biba_active_space() : 0;
++
++  cc::PaintFlags flags;
++  flags.setAntiAlias(true);
++  int x = FirstCellX(spaces.size());
++  for (int space : spaces) {
++    const gfx::PointF center(x + kCellSize / 2.0f, height() / 2.0f);
++    if (space == active) {
++      // Lift the accent a little so the dot reads on its own tinted frame.
++      flags.setColor(color_utils::BlendTowardMaxContrast(
++          biba::SpaceAccentColor(space), 0x40));
++      canvas->DrawCircle(center, kActiveDotRadius, flags);
++    } else {
++      flags.setColor(SkColorSetA(SK_ColorWHITE, kInactiveAlpha));
++      canvas->DrawCircle(center, kDotRadius, flags);
++    }
++    x += kCellSize;
++  }
++}
++
++bool BibaSpaceSwitcherView::OnMousePressed(const ui::MouseEvent& event) {
++  const std::vector<int> spaces = VisibleSpaces();
++  const int cell = (event.x() - FirstCellX(spaces.size())) / kCellSize;
++  if (event.x() < FirstCellX(spaces.size()) || cell < 0 ||
++      cell >= static_cast<int>(spaces.size())) {
++    return false;
++  }
++  if (auto* commands = chrome::BrowserCommandController::From(browser_)) {
++    commands->ExecuteCommand(IDC_BIBA_SWITCH_SPACE_0 + spaces[cell]);
++  }
++  return true;
++}
++
++BEGIN_METADATA(BibaSpaceSwitcherView)
++END_METADATA
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_switcher_view.h
+@@ -0,0 +1,42 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_BIBA_SPACE_SWITCHER_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_BIBA_SPACE_SWITCHER_VIEW_H_
++
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/views/view.h"
++
++class BrowserWindowInterface;
++
++// Row of dots at the bottom of the sidebar, one per Space in use. The active
++// Space's dot is drawn in its accent colour; clicking a dot switches to it.
++class BibaSpaceSwitcherView : public views::View {
++  METADATA_HEADER(BibaSpaceSwitcherView, views::View)
++
++ public:
++  explicit BibaSpaceSwitcherView(BrowserWindowInterface* browser);
++  BibaSpaceSwitcherView(const BibaSpaceSwitcherView&) = delete;
++  BibaSpaceSwitcherView& operator=(const BibaSpaceSwitcherView&) = delete;
++  ~BibaSpaceSwitcherView() override;
++
++  // views::View:
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override;
++  void OnPaint(gfx::Canvas* canvas) override;
++  bool OnMousePressed(const ui::MouseEvent& event) override;
++
++ private:
++  // Space indices shown as dots, in order.
++  std::vector<int> VisibleSpaces() const;
++  // Left edge of the first dot cell, so the row is centred.
++  int FirstCellX(size_t count) const;
++
++  raw_ptr<BrowserWindowInterface> browser_;
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_BIBA_SPACE_SWITCHER_VIEW_H_
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
+@@ -52,6 +52,8 @@
+ 
+ // Container for the vertical tabstrip and the other views sharing space with
+ // it, excluding the caption buttons.
++class BibaSpaceSwipeHandler;
++
+ class VerticalTabStripRegionView final
+     : public BaseTabStripRegionView,
+       public views::ResizeAreaDelegate,
+@@ -259,6 +261,8 @@
+   bool organizer_panel_was_visible_ = false;
+ 
+   raw_ptr<views::View> content_area_view_ = nullptr;
++  // Biba: swipe between Spaces + slide-in on Space change.
++  std::unique_ptr<BibaSpaceSwipeHandler> biba_swipe_handler_;
+   // Whether a leading exclusion exists due to window controls.
+   bool has_leading_exclusion_ = false;
+   FloatingStyle floating_style_ = FloatingStyle::kNone;
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.cc
+@@ -0,0 +1,128 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.h"
++
++#include <cmath>
++
++#include "base/functional/bind.h"
++#include "base/time/time.h"
++#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/ui/browser_command_controller.h"
++#include "ui/compositor/layer.h"
++#include "ui/events/event.h"
++#include "ui/gfx/animation/animation.h"
++#include "ui/gfx/animation/tween.h"
++#include "ui/gfx/geometry/transform.h"
++#include "ui/views/animation/animation_builder.h"
++#include "ui/views/view.h"
++
++namespace {
++
++constexpr int kMaxSpaces = 9;
++// Horizontal travel that commits a swipe.
++constexpr float kSwipeThreshold = 90.0f;
++// Horizontal must clearly dominate vertical, so tab-list scrolling never
++// switches Spaces by accident.
++constexpr float kHorizontalDominance = 1.5f;
++// Slide-in: starts this fraction of the sidebar width off to the side.
++constexpr float kSlideFraction = 0.35f;
++// Close to Dia's "firm" spring (response 0.25 s, damping 0.9).
++constexpr base::TimeDelta kSlideDuration = base::Milliseconds(280);
++
++}  // namespace
++
++BibaSpaceSwipeHandler::BibaSpaceSwipeHandler(BrowserWindowInterface* browser,
++                                             views::View* sidebar_content)
++    : browser_(browser), sidebar_content_(sidebar_content) {
++  if (auto* commands = chrome::BrowserCommandController::From(browser_)) {
++    space_changed_subscription_ = commands->BibaAddSpaceChangedCallback(
++        base::BindRepeating(&BibaSpaceSwipeHandler::OnSpaceChanged,
++                            base::Unretained(this)));
++  }
++}
++
++BibaSpaceSwipeHandler::~BibaSpaceSwipeHandler() = default;
++
++int BibaSpaceSwipeHandler::NeighbourSpace(int direction) const {
++  const auto* commands = chrome::BrowserCommandController::From(browser_);
++  if (!commands) {
++    return -1;
++  }
++  for (int i = commands->biba_active_space() + direction;
++       i >= 0 && i < kMaxSpaces; i += direction) {
++    if (commands->biba_space_in_use(i)) {
++      return i;
++    }
++  }
++  return -1;
++}
++
++void BibaSpaceSwipeHandler::OnScrollEvent(ui::ScrollEvent* event) {
++  if (event->type() != ui::EventType::kScroll) {
++    return;
++  }
++  if (event->scroll_event_phase() == ui::ScrollEventPhase::kBegan) {
++    accumulated_x_ = 0.0f;
++    switched_this_gesture_ = false;
++  }
++  // Ignore inertia; only the fingers' own travel counts.
++  if (event->momentum_phase() != ui::EventMomentumPhase::NONE) {
++    return;
++  }
++  const float dx = event->x_offset();
++  const float dy = event->y_offset();
++  if (std::fabs(dx) <= std::fabs(dy) * kHorizontalDominance) {
++    return;
++  }
++  // A horizontal gesture over the sidebar is ours; don't let it scroll
++  // anything else.
++  event->SetHandled();
++  if (switched_this_gesture_) {
++    return;
++  }
++  accumulated_x_ += dx;
++  if (std::fabs(accumulated_x_) < kSwipeThreshold) {
++    return;
++  }
++  // Content follows the fingers: swiping left (negative x offset) reveals the
++  // next Space on the right.
++  const int target = NeighbourSpace(accumulated_x_ < 0 ? +1 : -1);
++  switched_this_gesture_ = true;
++  if (target < 0) {
++    return;
++  }
++  if (auto* commands = chrome::BrowserCommandController::From(browser_)) {
++    commands->ExecuteCommand(IDC_BIBA_SWITCH_SPACE_0 + target);
++  }
++}
++
++void BibaSpaceSwipeHandler::OnSpaceChanged(int from, int to) {
++  ui::Layer* layer = sidebar_content_ ? sidebar_content_->layer() : nullptr;
++  if (!layer || from == to) {
++    return;
++  }
++  if (gfx::Animation::PrefersReducedMotion()) {
++    // Reduced motion: a plain cross-fade, no movement.
++    layer->SetOpacity(0.0f);
++    views::AnimationBuilder()
++        .Once()
++        .SetDuration(base::Milliseconds(150))
++        .SetOpacity(layer, 1.0f, gfx::Tween::EASE_OUT);
++    return;
++  }
++  // The new Space enters from the side it lives on.
++  const float direction = to > from ? 1.0f : -1.0f;
++  gfx::Transform start;
++  start.Translate(direction * kSlideFraction * sidebar_content_->width(), 0);
++  layer->SetTransform(start);
++  layer->SetOpacity(0.0f);
++  views::AnimationBuilder()
++      .SetPreemptionStrategy(
++          ui::LayerAnimator::IMMEDIATELY_ANIMATE_TO_NEW_TARGET)
++      .Once()
++      .SetDuration(kSlideDuration)
++      .SetTransform(layer, gfx::Transform(), gfx::Tween::ACCEL_20_DECEL_100)
++      .SetOpacity(layer, 1.0f, gfx::Tween::EASE_OUT);
++}
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.h
+@@ -0,0 +1,51 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_BIBA_SPACE_SWIPE_HANDLER_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_BIBA_SPACE_SWIPE_HANDLER_H_
++
++#include "base/callback_list.h"
++#include "base/memory/raw_ptr.h"
++#include "ui/events/event_handler.h"
++
++class BrowserWindowInterface;
++
++namespace views {
++class View;
++}
++
++// Sidebar Space navigation:
++//  - a horizontal two-finger swipe over the sidebar moves to the previous /
++//    next Space in use;
++//  - whenever the Space changes (swipe, dots, Ctrl+1..9) the sidebar content
++//    slides in from the side the new Space lives on.
++// Installed as a pre-target handler on the sidebar so it sees horizontal
++// scrolls before the vertical tab list does.
++class BibaSpaceSwipeHandler : public ui::EventHandler {
++ public:
++  BibaSpaceSwipeHandler(BrowserWindowInterface* browser,
++                        views::View* sidebar_content);
++  BibaSpaceSwipeHandler(const BibaSpaceSwipeHandler&) = delete;
++  BibaSpaceSwipeHandler& operator=(const BibaSpaceSwipeHandler&) = delete;
++  ~BibaSpaceSwipeHandler() override;
++
++  // ui::EventHandler:
++  void OnScrollEvent(ui::ScrollEvent* event) override;
++
++ private:
++  void OnSpaceChanged(int from, int to);
++  // Next (+1) / previous (-1) Space in use, or -1 if there is none.
++  int NeighbourSpace(int direction) const;
++
++  raw_ptr<BrowserWindowInterface> browser_;
++  raw_ptr<views::View> sidebar_content_;
++  base::CallbackListSubscription space_changed_subscription_;
++
++  // Horizontal distance accumulated in the current gesture, in DIPs.
++  float accumulated_x_ = 0.0f;
++  // One Space change per gesture.
++  bool switched_this_gesture_ = false;
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_BIBA_SPACE_SWIPE_HANDLER_H_
+--- a/chrome/browser/global_keyboard_shortcuts_mac.mm
++++ b/chrome/browser/global_keyboard_shortcuts_mac.mm
+@@ -4,6 +4,9 @@
+ 
+ #include "chrome/browser/global_keyboard_shortcuts_mac.h"
+ 
++#include "base/logging.h"
++#include "base/strings/sys_string_conversions.h"
++
+ #import <AppKit/AppKit.h>
+ #include <Carbon/Carbon.h>
+ 
+@@ -239,6 +242,13 @@
+   if ([event type] != NSEventTypeKeyDown)
+     return NoCommand();
+ 
++  // DEBUG (Biba): trace Ctrl shortcuts.
++  if ([event modifierFlags] & NSEventModifierFlagControl) {
++    LOG(ERROR) << "[biba-keys] keyCode=" << [event keyCode] << " chars='"
++               << base::SysNSStringToUTF8([event charactersIgnoringModifiers])
++               << "' menu_cmd=" << MenuCommandForKeyEvent(event);
++  }
++
+   int cmdNum = MenuCommandForKeyEvent(event);
+   if (cmdNum != NO_COMMAND)
+     return MainMenuCommand(cmdNum);

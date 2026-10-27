@@ -1,0 +1,331 @@
+--- a/chrome/browser/ui/biba/biba_spaces_controller.cc
++++ b/chrome/browser/ui/biba/biba_spaces_controller.cc
+@@ -78,7 +78,13 @@
+     model->ActivateTabAt(model->GetIndexOfTab(to_activate));
+   }
+ 
+-  // Park the outgoing Space.
++  // Park the outgoing Space, frozen.
++  current.freeze_votes.clear();
++  for (int i : outgoing) {
++    current.freeze_votes.push_back(
++        std::make_unique<performance_manager::freezing::FreezingVote>(
++            model->GetWebContentsAt(i)));
++  }
+   current.items = model->DetachTabsAndCollectionsForInsertion(outgoing);
+   active_space_ = index;
+   if (on_space_changed_) {
+@@ -115,6 +121,8 @@
+     }
+   }
+   space.items.clear();
++  // Visible again: thaw.
++  space.freeze_votes.clear();
+ 
+   tabs::TabInterface* last_active = space.last_active_tab.get();
+   space.last_active_tab = nullptr;
+--- a/chrome/browser/ui/biba/biba_spaces_controller.h
++++ b/chrome/browser/ui/biba/biba_spaces_controller.h
+@@ -14,6 +14,7 @@
+ #include "base/files/file_path.h"
+ #include "base/functional/callback.h"
+ #include "base/memory/weak_ptr.h"
++#include "components/performance_manager/public/freezing/freezing.h"
+ 
+ class BrowserWindowInterface;
+ class TabStripModel;
+@@ -77,6 +78,11 @@
+     std::vector<DetachedItem> items;
+     // Tab to re-activate when the Space becomes visible again.
+     raw_ptr<tabs::TabInterface> last_active_tab = nullptr;
++    // Parked tabs are frozen: no JS, timers or navigations while the Space
++    // is hidden. Saves CPU/RAM and keeps tab features that expect a window
++    // from running on detached tabs.
++    std::vector<std::unique_ptr<performance_manager::freezing::FreezingVote>>
++        freeze_votes;
+   };
+ 
+   // Inserts `space`'s detached items at the end of the strip and returns the
+--- a/chrome/browser/ui/views/location_bar/lens_overlay_homework_page_action_controller.cc
++++ b/chrome/browser/ui/views/location_bar/lens_overlay_homework_page_action_controller.cc
+@@ -105,6 +105,10 @@
+ }
+ 
+ bool LensOverlayHomeworkPageActionController::ShouldShow() {
++  // Biba: the tab may be parked in an inactive Space (no window).
++  if (!tab_->GetBrowserWindowInterface()) {
++    return false;
++  }
+   if (!lens::ShouldShowLensOverlayEduActionChip(base::to_address(profile_))) {
+     return false;
+   }
+--- a/chrome/browser/global_keyboard_shortcuts_mac.mm
++++ b/chrome/browser/global_keyboard_shortcuts_mac.mm
+@@ -126,7 +126,17 @@
+       {false, true,  true,  false, kVK_PageDown,          IDC_MOVE_TAB_NEXT},
+       {false, true,  true,  false, kVK_PageUp,            IDC_MOVE_TAB_PREVIOUS},
+ 
+-      // Biba: Ctrl-1..9 switch Spaces.
++      // Biba: Cmd-Option-1..9 switch Spaces. (Ctrl-1..9 below also works, but
++      // macOS Mission Control takes Ctrl-digit when several desktops exist.)
++      {true,  false, false, true,  kVK_ANSI_1,            IDC_BIBA_SWITCH_SPACE_0},
++      {true,  false, false, true,  kVK_ANSI_2,            IDC_BIBA_SWITCH_SPACE_1},
++      {true,  false, false, true,  kVK_ANSI_3,            IDC_BIBA_SWITCH_SPACE_2},
++      {true,  false, false, true,  kVK_ANSI_4,            IDC_BIBA_SWITCH_SPACE_3},
++      {true,  false, false, true,  kVK_ANSI_5,            IDC_BIBA_SWITCH_SPACE_4},
++      {true,  false, false, true,  kVK_ANSI_6,            IDC_BIBA_SWITCH_SPACE_5},
++      {true,  false, false, true,  kVK_ANSI_7,            IDC_BIBA_SWITCH_SPACE_6},
++      {true,  false, false, true,  kVK_ANSI_8,            IDC_BIBA_SWITCH_SPACE_7},
++      {true,  false, false, true,  kVK_ANSI_9,            IDC_BIBA_SWITCH_SPACE_8},
+       {false, false, true,  false, kVK_ANSI_1,            IDC_BIBA_SWITCH_SPACE_0},
+       {false, false, true,  false, kVK_ANSI_2,            IDC_BIBA_SWITCH_SPACE_1},
+       {false, false, true,  false, kVK_ANSI_3,            IDC_BIBA_SWITCH_SPACE_2},
+--- a/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.cc
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.cc
+@@ -4,13 +4,14 @@
+ 
+ #include "chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.h"
+ 
++#include <algorithm>
+ #include <cmath>
+ 
+ #include "base/functional/bind.h"
+-#include "base/time/time.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/ui/browser_command_controller.h"
+ #include "ui/compositor/layer.h"
++#include "ui/compositor/layer_animator.h"
+ #include "ui/events/event.h"
+ #include "ui/gfx/animation/animation.h"
+ #include "ui/gfx/animation/tween.h"
+@@ -21,21 +22,42 @@
+ namespace {
+ 
+ constexpr int kMaxSpaces = 9;
+-// Horizontal travel that commits a swipe.
+-constexpr float kSwipeThreshold = 90.0f;
+-// Horizontal must clearly dominate vertical, so tab-list scrolling never
+-// switches Spaces by accident.
++// Horizontal must clearly dominate vertical before we claim a gesture, so
++// scrolling the tab list never switches Spaces by accident.
+ constexpr float kHorizontalDominance = 1.5f;
+-// Slide-in: starts this fraction of the sidebar width off to the side.
+-constexpr float kSlideFraction = 0.35f;
++// Release decision: commit past this fraction of the sidebar width...
++constexpr float kCommitFraction = 0.35f;
++// ...or on a flick faster than this (DIPs per second) in the swipe direction.
++constexpr float kFlickVelocity = 600.0f;
++// Resistance when there is no Space in the swipe direction.
++constexpr float kRubberBand = 0.25f;
++// Opacity fades a little with distance so the move reads as a page turn.
++constexpr float kMinOpacity = 0.55f;
+ // Close to Dia's "firm" spring (response 0.25 s, damping 0.9).
+ constexpr base::TimeDelta kSlideDuration = base::Milliseconds(280);
++constexpr base::TimeDelta kSpringBackDuration = base::Milliseconds(220);
++
++bool IsGestureStart(const ui::ScrollEvent& event) {
++  return event.momentum_phase() == ui::EventMomentumPhase::MAY_BEGIN ||
++         event.momentum_phase() == ui::EventMomentumPhase::BEGAN ||
++         event.scroll_event_phase() == ui::ScrollEventPhase::kBegan;
++}
++
++// Fingers lifted: inertia starts, or the stream ends.
++bool IsGestureRelease(const ui::ScrollEvent& event) {
++  return event.momentum_phase() == ui::EventMomentumPhase::INERTIAL_UPDATE ||
++         event.momentum_phase() == ui::EventMomentumPhase::END ||
++         event.scroll_event_phase() == ui::ScrollEventPhase::kEnd;
++}
+ 
+ }  // namespace
+ 
+ BibaSpaceSwipeHandler::BibaSpaceSwipeHandler(BrowserWindowInterface* browser,
+-                                             views::View* sidebar_content)
+-    : browser_(browser), sidebar_content_(sidebar_content) {
++                                             views::View* sidebar,
++                                             MovableViewsGetter movable_views)
++    : browser_(browser),
++      sidebar_(sidebar),
++      movable_views_(std::move(movable_views)) {
+   if (auto* commands = chrome::BrowserCommandController::From(browser_)) {
+     space_changed_subscription_ = commands->BibaAddSpaceChangedCallback(
+         base::BindRepeating(&BibaSpaceSwipeHandler::OnSpaceChanged,
+@@ -59,70 +81,137 @@
+   return -1;
+ }
+ 
++void BibaSpaceSwipeHandler::SetOffset(float offset, float opacity) {
++  offset_ = offset;
++  gfx::Transform transform;
++  transform.Translate(offset, 0);
++  for (views::View* view : movable_views_.Run()) {
++    if (!view->layer()) {
++      view->SetPaintToLayer();
++      view->layer()->SetFillsBoundsOpaquely(false);
++    }
++    view->layer()->GetAnimator()->StopAnimating();
++    view->layer()->SetTransform(transform);
++    view->layer()->SetOpacity(opacity);
++  }
++}
++
++void BibaSpaceSwipeHandler::AnimateToRest(base::TimeDelta duration) {
++  offset_ = 0.0f;
++  views::AnimationBuilder builder;
++  builder.SetPreemptionStrategy(
++      ui::LayerAnimator::IMMEDIATELY_ANIMATE_TO_NEW_TARGET);
++  auto& block = builder.Once().SetDuration(duration);
++  for (views::View* view : movable_views_.Run()) {
++    if (!view->layer()) {
++      continue;
++    }
++    block.SetTransform(view->layer(), gfx::Transform(),
++                       gfx::Tween::ACCEL_20_DECEL_100)
++        .SetOpacity(view->layer(), 1.0f, gfx::Tween::EASE_OUT);
++  }
++}
++
++void BibaSpaceSwipeHandler::BeginTracking() {
++  tracking_ = true;
++  accumulated_x_ = 0.0f;
++  velocity_ = 0.0f;
++  last_event_time_ = base::TimeTicks();
++}
++
+ void BibaSpaceSwipeHandler::OnScrollEvent(ui::ScrollEvent* event) {
+   if (event->type() != ui::EventType::kScroll) {
+     return;
+   }
+-  if (event->scroll_event_phase() == ui::ScrollEventPhase::kBegan) {
+-    accumulated_x_ = 0.0f;
+-    switched_this_gesture_ = false;
++  if (IsGestureStart(*event) && !tracking_) {
++    BeginTracking();
+   }
+-  // Ignore inertia; only the fingers' own travel counts.
+-  if (event->momentum_phase() != ui::EventMomentumPhase::NONE) {
++  if (IsGestureRelease(*event)) {
++    if (tracking_) {
++      FinishTracking();
++    }
++    // Inertia after release belongs to nobody: drop it over the sidebar.
++    if (event->momentum_phase() == ui::EventMomentumPhase::INERTIAL_UPDATE &&
++        std::fabs(event->x_offset()) > std::fabs(event->y_offset())) {
++      event->SetHandled();
++    }
+     return;
+   }
++  if (!tracking_) {
++    BeginTracking();
++  }
++
+   const float dx = event->x_offset();
+   const float dy = event->y_offset();
+-  if (std::fabs(dx) <= std::fabs(dy) * kHorizontalDominance) {
++  // Not yet committed to horizontal: leave vertical scrolling alone.
++  if (accumulated_x_ == 0.0f &&
++      std::fabs(dx) <= std::fabs(dy) * kHorizontalDominance) {
+     return;
+   }
+-  // A horizontal gesture over the sidebar is ours; don't let it scroll
+-  // anything else.
+   event->SetHandled();
+-  if (switched_this_gesture_) {
+-    return;
++
++  // Velocity in DIPs/s, lightly smoothed over the last few events.
++  const base::TimeTicks now = event->time_stamp();
++  if (!last_event_time_.is_null()) {
++    const float dt = (now - last_event_time_).InSecondsF();
++    if (dt > 0.0f) {
++      velocity_ = 0.6f * velocity_ + 0.4f * (dx / dt);
++    }
+   }
++  last_event_time_ = now;
+   accumulated_x_ += dx;
+-  if (std::fabs(accumulated_x_) < kSwipeThreshold) {
+-    return;
+-  }
+-  // Content follows the fingers: swiping left (negative x offset) reveals the
+-  // next Space on the right.
+-  const int target = NeighbourSpace(accumulated_x_ < 0 ? +1 : -1);
+-  switched_this_gesture_ = true;
+-  if (target < 0) {
++
++  // Rubber-band when nothing lives in that direction (content follows the
++  // fingers: moving left reveals the next Space on the right).
++  const bool has_neighbour = NeighbourSpace(accumulated_x_ < 0 ? +1 : -1) >= 0;
++  const float offset =
++      has_neighbour ? accumulated_x_ : accumulated_x_ * kRubberBand;
++  const float width = std::max(1, sidebar_->width());
++  const float progress = std::min(1.0f, std::fabs(offset) / width);
++  SetOffset(offset, 1.0f - (1.0f - kMinOpacity) * progress);
++}
++
++void BibaSpaceSwipeHandler::FinishTracking() {
++  tracking_ = false;
++  const float width = std::max(1, sidebar_->width());
++  const int direction = accumulated_x_ < 0 ? +1 : -1;
++  const int target = NeighbourSpace(direction);
++  const bool far_enough = std::fabs(accumulated_x_) > width * kCommitFraction;
++  // A flick counts when it's fast *in the same direction* as the drag.
++  const bool flick = std::fabs(velocity_) > kFlickVelocity &&
++                     (velocity_ < 0) == (accumulated_x_ < 0);
++  if (target >= 0 && accumulated_x_ != 0.0f && (far_enough || flick)) {
++    // The new Space enters from where the fingers are heading; start it on
++    // the opposite side of the current offset so the motion is continuous.
++    handoff_offset_ = offset_ + direction * width;
++    if (auto* commands = chrome::BrowserCommandController::From(browser_)) {
++      commands->ExecuteCommand(IDC_BIBA_SWITCH_SPACE_0 + target);
++    }
+     return;
+   }
+-  if (auto* commands = chrome::BrowserCommandController::From(browser_)) {
+-    commands->ExecuteCommand(IDC_BIBA_SWITCH_SPACE_0 + target);
++  if (offset_ != 0.0f) {
++    AnimateToRest(kSpringBackDuration);
+   }
+ }
+ 
+ void BibaSpaceSwipeHandler::OnSpaceChanged(int from, int to) {
+-  ui::Layer* layer = sidebar_content_ ? sidebar_content_->layer() : nullptr;
+-  if (!layer || from == to) {
++  if (from == to) {
+     return;
+   }
++  const float width = std::max(1, sidebar_->width());
+   if (gfx::Animation::PrefersReducedMotion()) {
+     // Reduced motion: a plain cross-fade, no movement.
+-    layer->SetOpacity(0.0f);
+-    views::AnimationBuilder()
+-        .Once()
+-        .SetDuration(base::Milliseconds(150))
+-        .SetOpacity(layer, 1.0f, gfx::Tween::EASE_OUT);
+-    return;
+-  }
+-  // The new Space enters from the side it lives on.
+-  const float direction = to > from ? 1.0f : -1.0f;
+-  gfx::Transform start;
+-  start.Translate(direction * kSlideFraction * sidebar_content_->width(), 0);
+-  layer->SetTransform(start);
+-  layer->SetOpacity(0.0f);
+-  views::AnimationBuilder()
+-      .SetPreemptionStrategy(
+-          ui::LayerAnimator::IMMEDIATELY_ANIMATE_TO_NEW_TARGET)
+-      .Once()
+-      .SetDuration(kSlideDuration)
+-      .SetTransform(layer, gfx::Transform(), gfx::Tween::ACCEL_20_DECEL_100)
+-      .SetOpacity(layer, 1.0f, gfx::Tween::EASE_OUT);
++    handoff_offset_ = 0.0f;
++    SetOffset(0.0f, 0.0f);
++    AnimateToRest(base::Milliseconds(150));
++    return;
++  }
++  // From a swipe: continue from where the fingers left the old list.
++  // Otherwise (dots, shortcuts): enter from the side the new Space lives on.
++  const float start = handoff_offset_ != 0.0f
++                          ? handoff_offset_
++                          : (to > from ? 1.0f : -1.0f) * 0.35f * width;
++  handoff_offset_ = 0.0f;
++  SetOffset(start, kMinOpacity);
++  AnimateToRest(kSlideDuration);
+ }

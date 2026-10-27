@@ -1,0 +1,18 @@
+# Biba branding resources, applied after Helium's (same format: <source in out/> <dest in chromium src>)
+# Build sources first: biba/resources/build_resources.sh
+
+mac/Assets.car chrome/app/theme/chromium/mac/Assets.car
+mac/app.icns chrome/app/theme/chromium/mac/app.icns
+
+branding/product_logo_22_mono.png chrome/app/theme/chromium/product_logo_22_mono.png
+
+product_icon/16x16.png chrome/app/theme/chromium/product_logo_16.png
+product_icon/24x24.png chrome/app/theme/chromium/product_logo_24.png
+product_icon/48x48.png chrome/app/theme/chromium/product_logo_48.png
+product_icon/64x64.png chrome/app/theme/chromium/product_logo_64.png
+product_icon/128x128.png chrome/app/theme/chromium/product_logo_128.png
+product_icon/256x256.png chrome/app/theme/chromium/product_logo_256.png
+product_icon/16x16.png chrome/app/theme/default_100_percent/chromium/product_logo_16.png
+product_icon/32x32.png chrome/app/theme/default_100_percent/chromium/product_logo_32.png
+product_icon/32x32.png chrome/app/theme/default_200_percent/chromium/product_logo_16.png
+product_icon/64x64.png chrome/app/theme/default_200_percent/chromium/product_logo_32.png

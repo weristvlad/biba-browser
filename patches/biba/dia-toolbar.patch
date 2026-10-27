@@ -1,0 +1,89 @@
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -1311,11 +1311,10 @@
+     top_container_layout.bounds =
+         GetTopContainerBoundsInParent(top_container_local_bounds, params);
+     if (layout_data_->tab_strip_type == TabStripType::kVertical) {
+-      // Biba: the toolbar is the top of the content card, inset from the
+-      // window edge like the card itself.
+-      top_container_layout.bounds.Inset(
+-          gfx::Insets::TLBR(MultiContentsView::kSplitViewContentInset, 0, 0,
+-                            MultiContentsView::kSplitViewContentInset));
++      // Biba: the toolbar sits on the frame, level with the traffic lights,
++      // and its right edge lines up with the content card below.
++      top_container_layout.bounds.Inset(gfx::Insets::TLBR(
++          0, 0, 0, MultiContentsView::kSplitViewContentInset));
+     }
+     params.SetTop(top_container_layout.bounds.bottom());
+   }
+--- a/chrome/browser/ui/views/frame/themed_background.cc
++++ b/chrome/browser/ui/views/frame/themed_background.cc
+@@ -116,9 +116,12 @@
+                                        const views::View* view,
+                                        const BrowserView* browser_view,
+                                        ThemeChoice theme_choice) {
+-  // Biba: frame surfaces carry the active Space's colour. The toolbar keeps
+-  // the card colour: it is the top of the content card (Dia layout).
+-  if (theme_choice == ThemeChoice::kFrameTheme &&
++  // Biba: frame surfaces carry the active Space's colour. The toolbar sits on
++  // the frame too (Dia layout); only the page below it is a card.
++  const bool biba_frame_surface =
++      theme_choice == ThemeChoice::kFrameTheme ||
++      std::string_view(view->GetClassName()) == "ToolbarView";
++  if (biba_frame_surface &&
+       biba::PaintSpaceFrame(canvas, view, browser_view)) {
+     return;
+   }
+--- a/chrome/browser/ui/views/location_bar/location_bar_view.cc
++++ b/chrome/browser/ui/views/location_bar/location_bar_view.cc
+@@ -2581,8 +2581,9 @@
+     biba_title_label_->SetText(u" / " + title);
+     biba_title_label_->SetFontList(omnibox_view_->GetFontList());
+     if (const auto* color_provider = GetColorProvider()) {
+-      biba_title_label_->SetEnabledColor(
+-          color_provider->GetColor(kColorOmniboxTextDimmed));
++      // Dia: the title is a quieter echo of the domain.
++      biba_title_label_->SetEnabledColor(SkColorSetA(
++          color_provider->GetColor(kColorOmniboxText), 0x80));
+     }
+     LayoutBibaTitle();
+   }
+--- a/chrome/browser/ui/views/tabs/common/vertical_tab_style_views.cc
++++ b/chrome/browser/ui/views/tabs/common/vertical_tab_style_views.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/ui/views/tabs/common/vertical_tab_style_views.h"
++#include "ui/color/color_provider.h"
++#include "ui/color/color_id.h"
+ 
+ #include <optional>
+ #include <string>
+@@ -214,6 +216,27 @@
+ 
+ SkColor VerticalTabStyleViews::GetCurrentTabBackgroundColor(
+     TabStyle::TabSelectionState selection_state) const {
++  // Biba (Dia look): tabs are light veils over the tinted sidebar instead of
++  // opaque toolbar-coloured pills.
++  if (const ui::ColorProvider* provider =
++          delegate_->GetView()->GetColorProvider()) {
++    const bool dark =
++        color_utils::IsDark(provider->GetColor(ui::kColorSysSurface));
++    float alpha = 0.0f;
++    switch (selection_state) {
++      case TabStyle::TabSelectionState::kActive:
++        alpha = dark ? 0.14f : 0.65f;
++        break;
++      case TabStyle::TabSelectionState::kSelected:
++        alpha = dark ? 0.09f : 0.40f;
++        break;
++      case TabStyle::TabSelectionState::kInactive:
++        alpha = (dark ? 0.07f : 0.30f) *
++                static_cast<float>(delegate_->GetHoverAnimationValue());
++        break;
++    }
++    return SkColorSetA(SK_ColorWHITE, static_cast<U8CPU>(alpha * 255.0f));
++  }
+   if (helium::ShouldUseNativeFrameMaterials(
+           delegate_->GetBrowserWindowInterface()) &&
+       selection_state == TabStyle::TabSelectionState::kInactive) {

@@ -1,0 +1,25 @@
+--- a/chrome/browser/global_keyboard_shortcuts_mac.mm
++++ b/chrome/browser/global_keyboard_shortcuts_mac.mm
+@@ -252,12 +252,6 @@
+   if ([event type] != NSEventTypeKeyDown)
+     return NoCommand();
+ 
+-  // DEBUG (Biba): trace Ctrl shortcuts.
+-  if ([event modifierFlags] & NSEventModifierFlagControl) {
+-    LOG(ERROR) << "[biba-keys] keyCode=" << [event keyCode] << " chars='"
+-               << base::SysNSStringToUTF8([event charactersIgnoringModifiers])
+-               << "' menu_cmd=" << MenuCommandForKeyEvent(event);
+-  }
+ 
+   int cmdNum = MenuCommandForKeyEvent(event);
+   if (cmdNum != NO_COMMAND)
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -971,7 +971,6 @@
+     case IDC_BIBA_SWITCH_SPACE_6:
+     case IDC_BIBA_SWITCH_SPACE_7:
+     case IDC_BIBA_SWITCH_SPACE_8:
+-      LOG(ERROR) << "[biba-keys] switch space command " << id;
+       if (!biba_spaces_) {
+         biba_spaces_ = std::make_unique<BibaSpacesController>(
+             browser_->GetTabStripModel());

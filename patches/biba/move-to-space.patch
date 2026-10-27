@@ -1,0 +1,396 @@
+--- a/chrome/browser/ui/biba/biba_spaces_controller.cc
++++ b/chrome/browser/ui/biba/biba_spaces_controller.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/biba/biba_spaces_controller.h"
+ 
++#include <algorithm>
+ #include <utility>
+ #include "chrome/browser/profiles/profile.h"
+ #include "base/values.h"
+@@ -81,6 +82,9 @@
+     return;
+   }
+   state_path_ = path;
++  state_writer_ = base::ThreadPool::CreateSequencedTaskRunner(
++      {base::MayBlock(), base::TaskPriority::BEST_EFFORT,
++       base::TaskShutdownBehavior::BLOCK_SHUTDOWN});
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+       base::BindOnce(
+@@ -106,12 +110,12 @@
+   if (!value || !value->is_dict()) {
+     return;
+   }
+-  const base::Value::Dict& dict = value->GetDict();
++  const base::DictValue& dict = value->GetDict();
+   const int active = dict.FindInt("active").value_or(0);
+   if (active < 0 || active >= kMaxSpaces) {
+     return;
+   }
+-  if (const base::Value::List* spaces = dict.FindList("spaces")) {
++  if (const base::ListValue* spaces = dict.FindList("spaces")) {
+     for (size_t i = 0; i < spaces->size() && i < kMaxSpaces; ++i) {
+       if (static_cast<int>(i) == active || !(*spaces)[i].is_list()) {
+         continue;
+@@ -141,29 +145,29 @@
+     return;
+   }
+   auto tab_value = [](const GURL& url, const std::u16string& title) {
+-    base::Value::Dict tab;
++    base::DictValue tab;
+     tab.Set("url", url.spec());
+     tab.Set("title", base::UTF16ToUTF8(title));
+     return tab;
+   };
+-  base::Value::List spaces;
++  base::ListValue spaces;
+   for (int i = 0; i < kMaxSpaces; ++i) {
+-    base::Value::List tabs;
++    base::ListValue tab_list;
+     if (i != active_space_) {
+       for (const SavedTab& saved : saved_[i]) {
+-        tabs.Append(tab_value(saved.url, saved.title));
++        tab_list.Append(tab_value(saved.url, saved.title));
+       }
+       for (const tabs::TabInterface* tab : ParkedTabs(i)) {
+         content::WebContents* contents = tab->GetContents();
+         if (contents && contents->GetLastCommittedURL().is_valid()) {
+-          tabs.Append(tab_value(contents->GetLastCommittedURL(),
++          tab_list.Append(tab_value(contents->GetLastCommittedURL(),
+                                 contents->GetTitle()));
+         }
+       }
+     }
+-    spaces.Append(std::move(tabs));
++    spaces.Append(std::move(tab_list));
+   }
+-  base::Value::Dict state;
++  base::DictValue state;
+   state.Set("version", 1);
+   state.Set("active", active_space_);
+   state.Set("spaces", std::move(spaces));
+@@ -172,10 +176,8 @@
+   if (!json) {
+     return;
+   }
+-  base::ThreadPool::PostTask(
++  state_writer_->PostTask(
+       FROM_HERE,
+-      {base::MayBlock(), base::TaskPriority::BEST_EFFORT,
+-       base::TaskShutdownBehavior::BLOCK_SHUTDOWN},
+       base::BindOnce(
+           [](base::FilePath path, std::string json) {
+             base::ImportantFileWriter::WriteFileAtomically(path, json);
+@@ -270,6 +272,48 @@
+   }
+ }
+ 
++int BibaSpacesController::MoveTabsToSpace(const std::vector<int>& indices,
++                                          int index) {
++  if (index < 0) {
++    for (int i = 0; i < kMaxSpaces; ++i) {
++      if (!IsSpaceInUse(i)) {
++        index = i;
++        break;
++      }
++    }
++  }
++  if (index < 0 || index >= kMaxSpaces || index == active_space_) {
++    return -1;
++  }
++  TabStripModel* model = tab_strip_model_.get();
++  const int first_unpinned = model->IndexOfFirstNonPinnedTab();
++  std::vector<int> moving;
++  for (int i : indices) {
++    if (i >= first_unpinned && model->ContainsIndex(i)) {
++      moving.push_back(i);
++    }
++  }
++  if (moving.empty()) {
++    return -1;
++  }
++  std::sort(moving.begin(), moving.end());
++  // A strip that becomes empty closes its window: keep a fresh tab.
++  if (static_cast<int>(moving.size()) == model->count()) {
++    model->delegate()->AddTabAt(GURL(), -1, /*foreground=*/true);
++  }
++  Space& target = spaces_[index];
++  for (int i : moving) {
++    target.freeze_votes.push_back(
++        std::make_unique<performance_manager::freezing::FreezingVote>(
++            model->GetWebContentsAt(i)));
++  }
++  for (DetachedItem& item : model->DetachTabsAndCollectionsForInsertion(moving)) {
++    target.items.push_back(std::move(item));
++  }
++  SaveState();
++  return index;
++}
++
+ std::vector<BibaSpacesController::PreviewItem> BibaSpacesController::GetPreview(
+     int index) const {
+   std::vector<PreviewItem> preview;
+@@ -371,6 +415,11 @@
+   if (step > 0) {
+     SwitchToSpace(kTarget[step]);
+   }
++  if (step == 4 && tab_strip_model_->count() > 1) {
++    // Move-to-Space: send the last tab to a fresh Space.
++    const int moved_to = MoveTabsToSpace({tab_strip_model_->count() - 1}, -1);
++    LOG(ERROR) << "[biba-selftest] moved last tab to space " << moved_to + 1;
++  }
+   std::string label = "step " + base::NumberToString(step) + " space " +
+                       base::NumberToString(active_space_ + 1);
+   LogStrip(label.c_str());
+--- a/chrome/browser/ui/biba/biba_spaces_controller.h
++++ b/chrome/browser/ui/biba/biba_spaces_controller.h
+@@ -14,6 +14,8 @@
+ #include <string>
+ 
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/task/sequenced_task_runner.h"
+ #include "ui/gfx/image/image.h"
+ #include "url/gurl.h"
+ #include "base/files/file_path.h"
+@@ -72,6 +74,10 @@
+   // been opened starts with a single new tab.
+   void SwitchToSpace(int index);
+ 
++  // Parks the unpinned tabs at `indices` (strip indices) in Space `index`
++  // (-1: the first unused Space). Returns the Space they went to, or -1.
++  int MoveTabsToSpace(const std::vector<int>& indices, int index);
++
+   // DEBUG (biba/debug-spaces-selftest.patch): switches Spaces on a timer and
+   // logs the strip after each step. Enabled with --biba-spaces-selftest.
+   // If `shots_dir` is non-empty, a PNG of the window is saved after each step.
+@@ -126,6 +132,8 @@
+   base::RepeatingClosure on_space_changed_;
+   std::array<std::vector<SavedTab>, kMaxSpaces> saved_;
+   base::FilePath state_path_;
++  // Writes run in order, so the newest state always lands last.
++  scoped_refptr<base::SequencedTaskRunner> state_writer_;
+   bool switched_ = false;
+ 
+   void SelfTestStep(int step);
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -537,6 +537,24 @@
+   return biba_spaces_ ? biba_spaces_->IsSpaceInUse(index) : index == 0;
+ }
+ 
++void BrowserCommandController::BibaMoveTabsToSpace(
++    const std::vector<int>& indices,
++    int space) {
++  if (!biba_spaces_) {
++    biba_spaces_ =
++        std::make_unique<BibaSpacesController>(browser_->GetTabStripModel());
++    biba_spaces_->set_on_space_changed(
++        base::BindRepeating(&BrowserCommandController::RepaintBibaFrame,
++                            base::Unretained(this)));
++  }
++  const int target = biba_spaces_->MoveTabsToSpace(indices, space);
++  if (target >= 0) {
++    // Same index twice: "Space `target` changed while hidden".
++    biba_space_changed_callbacks_.Notify(target, target);
++    RepaintBibaFrame();
++  }
++}
++
+ void BrowserCommandController::RepaintBibaFrame() {
+   const int to = biba_active_space();
+   if (to != biba_last_space_) {
+--- a/chrome/browser/ui/browser_command_controller.h
++++ b/chrome/browser/ui/browser_command_controller.h
+@@ -137,6 +137,9 @@
+   float biba_frame_blend_amount() const { return biba_frame_blend_amount_; }
+   // Biba: whether Space `index` exists (visible or holding parked tabs).
+   bool biba_space_in_use(int index) const;
++  // Biba: moves the unpinned tabs at `indices` to Space `space` (-1: the
++  // first unused Space). The tabs are parked there, frozen.
++  void BibaMoveTabsToSpace(const std::vector<int>& indices, int space);
+   // Biba: titles + favicons of a parked Space (empty for the visible one).
+   std::vector<std::pair<std::u16string, gfx::Image>> biba_space_preview(
+       int index) const;
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/tabs/tab_menu_model.h"
+ 
++#include "base/strings/string_number_conversions.h"
++
+ #include <memory>
+ #include <optional>
+ 
+@@ -308,6 +310,26 @@
+   }
+ }
+ 
++
++// Biba: items of the "Move to Space" submenu. Command ids are Space indices;
++// kNewSpace picks the first unused Space.
++class BibaMoveToSpaceDelegate : public ui::SimpleMenuModel::Delegate {
++ public:
++  static constexpr int kNewSpace = 100;
++
++  BibaMoveToSpaceDelegate(TabStripModel* tab_strip, int index)
++      : tab_strip_(tab_strip), index_(index) {}
++
++  void ExecuteCommand(int command_id, int event_flags) override {
++    tab_strip_->BibaMoveToSpace(index_, command_id == kNewSpace ? -1
++                                                                : command_id);
++  }
++
++ private:
++  raw_ptr<TabStripModel> tab_strip_;
++  const int index_;
++};
++
+ // Capitalization Policy (go/chrome-capitalization):
+ // Native right-click tab context menus on macOS use Title Case (`_MAC` string
+ // variants) to follow Apple Human Interface Guidelines (HIG), while other
+@@ -472,6 +494,29 @@
+     }
+   }
+ 
++  // Biba: send the tabs to another Space of this window.
++  const int biba_active_space = tab_strip_->BibaActiveSpace();
++  if (biba_active_space >= 0 &&
++      tab_strip_->IndexOfFirstNonPinnedTab() <= index) {
++    biba_space_submenu_delegate_ =
++        std::make_unique<BibaMoveToSpaceDelegate>(tab_strip_, index);
++    biba_space_submenu_ = std::make_unique<ui::SimpleMenuModel>(
++        biba_space_submenu_delegate_.get());
++    for (int space = 0; space < 9; ++space) {
++      if (space != biba_active_space && tab_strip_->BibaSpaceInUse(space)) {
++        biba_space_submenu_->AddItem(
++            space, u"Space " + base::NumberToString16(space + 1));
++      }
++    }
++    if (biba_space_submenu_->GetItemCount() > 0) {
++      biba_space_submenu_->AddSeparator(ui::NORMAL_SEPARATOR);
++    }
++    biba_space_submenu_->AddItem(BibaMoveToSpaceDelegate::kNewSpace,
++                                 u"New Space");
++    AddSubMenu(TabStripModel::CommandBibaMoveToSpace, u"Move to Space",
++               biba_space_submenu_.get());
++  }
++
+   if (ExistingWindowSubMenuModel::ShouldShowSubmenu(tab_strip_->profile())) {
+     // Create submenu with existing windows
+     add_to_existing_window_submenu_ = ExistingWindowSubMenuModel::Create(
+--- a/chrome/browser/ui/tabs/tab_menu_model.h
++++ b/chrome/browser/ui/tabs/tab_menu_model.h
+@@ -98,6 +98,9 @@
+ 
+   std::unique_ptr<ui::SimpleMenuModel> add_to_existing_group_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel> add_to_existing_window_submenu_;
++  // Biba: "Move to Space" submenu and the delegate that runs its items.
++  std::unique_ptr<ui::SimpleMenuModel::Delegate> biba_space_submenu_delegate_;
++  std::unique_ptr<ui::SimpleMenuModel> biba_space_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel>
+       add_to_existing_comparison_table_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel> swap_with_split_submenu_;
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -2869,6 +2869,9 @@
+ 
+     case CommandToggleVertical:
+       return true;
++
++    case CommandBibaMoveToSpace:
++      return IndexOfFirstNonPinnedTab() <= context_index;
+   }
+   SCOPED_CRASH_KEY_NUMBER("TabStripModel", "command_id", command_id);
+   NOTREACHED() << "Unsupported command: " << command_id;
+@@ -3316,6 +3319,9 @@
+                               /*delete_groups=*/true);
+       break;
+     }
++    case CommandBibaMoveToSpace:
++      // Handled by the submenu's items.
++      break;
+     case CommandToggleVertical: {
+       base::UmaHistogramCounts1000(
+           "Tab.ContextMenu.ToggleVertical.SelectedTabsCount",
+@@ -3599,6 +3605,35 @@
+   }
+ }
+ 
++int TabStripModel::BibaActiveSpace() {
++  BrowserWindowInterface* const browser =
++      delegate()->GetBrowserWindowInterface();
++  auto* commands =
++      browser ? chrome::BrowserCommandController::From(browser) : nullptr;
++  return commands ? commands->biba_active_space() : -1;
++}
++
++bool TabStripModel::BibaSpaceInUse(int space) {
++  BrowserWindowInterface* const browser =
++      delegate()->GetBrowserWindowInterface();
++  auto* commands =
++      browser ? chrome::BrowserCommandController::From(browser) : nullptr;
++  return commands && commands->biba_space_in_use(space);
++}
++
++void TabStripModel::BibaMoveToSpace(int context_index, int space) {
++  if (!ContainsIndex(context_index)) {
++    return;
++  }
++  BrowserWindowInterface* const browser =
++      delegate()->GetBrowserWindowInterface();
++  if (auto* commands =
++          browser ? chrome::BrowserCommandController::From(browser)
++                  : nullptr) {
++    commands->BibaMoveTabsToSpace(GetIndicesForCommand(context_index), space);
++  }
++}
++
+ bool TabStripModel::WillContextMenuMuteTabs(int index) {
+   for (int tab_index : GetIndicesForCommand(index)) {
+     WebContents* const contents = GetWebContentsAt(tab_index);
+--- a/chrome/browser/ui/tabs/tab_strip_model.h
++++ b/chrome/browser/ui/tabs/tab_strip_model.h
+@@ -849,6 +849,14 @@
+   // index supplied to `ExecuteContextMenuCommand`.
+   bool WillContextMenuMuteTabs(int index);
+ 
++  // Biba: Spaces of the window that owns this strip. `BibaActiveSpace()` is
++  // -1 when the strip has no browser window.
++  int BibaActiveSpace();
++  bool BibaSpaceInUse(int space);
++  // Moves the tabs the context menu at `context_index` applies to into Space
++  // `space` (-1: the first unused Space).
++  void BibaMoveToSpace(int context_index, int space);
++
+   // Returns true if 'CommandToggleSiteMuted' will mute. `index` is the
+   // index supplied to `ExecuteContextMenuCommand`.
+   bool WillContextMenuMuteSites(int index);
+--- a/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.cc
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.cc
+@@ -408,6 +408,12 @@
+ 
+ void BibaSpaceSwipeHandler::OnSpaceChanged(int from, int to) {
+   if (from == to) {
++    // Space `to` changed while hidden (tabs moved there): its snapshot is
++    // stale; the preview falls back to drawing its rows.
++    snapshots_.erase(to);
++    if (preview_space_ == to) {
++      preview_space_ = -1;
++    }
+     return;
+   }
+   const bool from_swipe = handoff_offset_ != 0.0f;
+--- a/components/tabs/public/tab_context_menu_command.h
++++ b/components/tabs/public/tab_context_menu_command.h
+@@ -42,6 +42,8 @@
+   CommandToggleFocusGroup,
+   CommandDiscard,
+   CommandToggleTabMuted,
++  // Biba: "Move to Space" submenu.
++  CommandBibaMoveToSpace,
+ };
+ // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
+ 

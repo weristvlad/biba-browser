@@ -1,0 +1,466 @@
+--- a/chrome/browser/ui/layout_constants.cc
++++ b/chrome/browser/ui/layout_constants.cc
+@@ -150,12 +150,14 @@
+       return 20;
+     case LayoutConstant::kMainBackgroundRegionCornerRadius:
+     case LayoutConstant::kToolbarCornerRadius:
+-    case LayoutConstant::kVerticalTabCornerRadius:
+       return 8;
++    // Biba (Dia): roomier sidebar rows and app tiles.
++    case LayoutConstant::kVerticalTabCornerRadius:
++      return 10;
+     case LayoutConstant::kVerticalTabHeight:
+-      return 30;
++      return 34;
+     case LayoutConstant::kVerticalTabPinnedHeight:
+-      return 30;
++      return 40;
+     case LayoutConstant::kVerticalTabMinWidth:
+       return 30;
+     case LayoutConstant::kVerticalTabStripHorizontalPadding:
+--- a/chrome/browser/ui/views/frame/biba_frame_paint.cc
++++ b/chrome/browser/ui/views/frame/biba_frame_paint.cc
+@@ -12,6 +12,16 @@
+ #include "base/no_destructor.h"
+ #include "chrome/browser/ui/browser_command_controller.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "ui/gfx/scoped_canvas.h"
++#include "ui/gfx/geometry/skia_conversions.h"
++#include "third_party/skia/include/core/SkRRect.h"
++#include "ui/gfx/shadow_value.h"
++#include "ui/gfx/skia_paint_util.h"
++#include "content/public/browser/web_contents.h"
++#include "chrome/browser/ui/views/frame/top_container_view.h"
++#include "chrome/browser/ui/views/frame/multi_contents_view.h"
++#include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "cc/paint/paint_flags.h"
+ #include "cc/paint/paint_image.h"
+ #include "cc/paint/paint_shader.h"
+@@ -51,8 +61,8 @@
+ // Accent share at the gradient's two ends (top-left, bottom-right).
+ constexpr float kTintStartDark = 0.42f;
+ constexpr float kTintEndDark = 0.20f;
+-constexpr float kTintStartLight = 0.40f;
+-constexpr float kTintEndLight = 0.20f;
++constexpr float kTintStartLight = 0.32f;
++constexpr float kTintEndLight = 0.16f;
+ 
+ // Rotates `color`'s hue by `degrees` (analogous companion for the gradient).
+ SkColor RotateHue(SkColor color, double degrees) {
+@@ -96,6 +106,53 @@
+   return *tile;
+ }
+ 
++// Soft drop shadow of the page card (toolbar + page) onto the frame. Every
++// frame view paints its slice in widget coordinates, so it reads as one.
++void PaintCardShadow(gfx::Canvas* canvas,
++                     const views::View* view,
++                     BrowserView* browser_view,
++                     bool dark) {
++  if (!browser_view->ShouldDrawVerticalTabStrip() ||
++      browser_view->IsFullscreen() || !browser_view->top_container() ||
++      !browser_view->multi_contents_view() ||
++      !browser_view->multi_contents_view()->GetVisible()) {
++    return;
++  }
++  gfx::Rect card = browser_view->top_container()->GetBoundsInScreen();
++  card.Union(browser_view->multi_contents_view()->GetBoundsInScreen());
++  // The page area inside MultiContentsView is inset; the card is what's
++  // visible: take its inner edges.
++  card.Inset(gfx::Insets::TLBR(0, 0, MultiContentsView::kSplitViewContentInset,
++                               0));
++  const gfx::Point view_origin = view->GetBoundsInScreen().origin();
++  card.Offset(-view_origin.x(), -view_origin.y());
++  if (!gfx::Rect(view->size()).Intersects(
++          gfx::Rect(card.x() - 24, card.y() - 24, card.width() + 48,
++                    card.height() + 48))) {
++    return;
++  }
++  const float radius =
++      GetLayoutConstant(LayoutConstant::kMainBackgroundRegionCornerRadius);
++  const SkRRect rrect =
++      SkRRect::MakeRectXY(gfx::RectToSkRect(card), radius, radius);
++  gfx::ScopedCanvas scoped(canvas);
++  canvas->sk_canvas()->clipRRect(rrect, SkClipOp::kDifference, true);
++  // The looper draws the blurred shadow; the shape itself is clipped away.
++  cc::PaintFlags shadow;
++  shadow.setAntiAlias(true);
++  shadow.setColor(SK_ColorBLACK);
++  shadow.setLooper(gfx::CreateShadowDrawLooper({gfx::ShadowValue(
++      gfx::Vector2d(0, 2), 18, SkColorSetA(SK_ColorBLACK, dark ? 0x66 : 0x38))}));
++  canvas->sk_canvas()->drawRRect(rrect, shadow);
++  // Hairline edge so the card holds its shape on light frames.
++  cc::PaintFlags edge;
++  edge.setAntiAlias(true);
++  edge.setStyle(cc::PaintFlags::kStroke_Style);
++  edge.setStrokeWidth(1.0f);
++  edge.setColor(SkColorSetA(SK_ColorBLACK, dark ? 0x40 : 0x14));
++  canvas->sk_canvas()->drawRRect(rrect, edge);
++}
++
+ }  // namespace
+ 
+ SkColor SpaceAccentColor(int index) {
+@@ -160,7 +217,36 @@
+       GrainTile(), SkTileMode::kRepeat,
+       SkTileMode::kRepeat, &offset));
+   canvas->DrawRect(gfx::RectF(view->GetLocalBounds()), grain);
++
++  PaintCardShadow(canvas, view, const_cast<BrowserView*>(browser_view), dark);
+   return true;
+ }
+ 
++std::optional<SkColor> SiteToolbarColor(const views::View* view,
++                                        const BrowserView* browser_view) {
++  if (!browser_view || !browser_view->GetIsNormalType() ||
++      !view->GetColorProvider()) {
++    return std::nullopt;
++  }
++  content::WebContents* contents =
++      const_cast<BrowserView*>(browser_view)->GetActiveWebContents();
++  if (!contents) {
++    return std::nullopt;
++  }
++  std::optional<SkColor> site = contents->GetThemeColor();
++  if (!site) {
++    site = contents->GetBackgroundColor();
++  }
++  if (!site || SkColorGetA(*site) != SK_AlphaOPAQUE) {
++    return std::nullopt;
++  }
++  // Toolbar text and icons follow the browser theme, so only take colours on
++  // the theme's side (dark page in dark mode, light page in light mode).
++  const SkColor toolbar = view->GetColorProvider()->GetColor(kColorToolbar);
++  if (color_utils::IsDark(*site) != color_utils::IsDark(toolbar)) {
++    return std::nullopt;
++  }
++  return site;
++}
++
+ }  // namespace biba
+--- a/chrome/browser/ui/views/frame/biba_frame_paint.h
++++ b/chrome/browser/ui/views/frame/biba_frame_paint.h
+@@ -5,6 +5,8 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_FRAME_BIBA_FRAME_PAINT_H_
+ #define CHROME_BROWSER_UI_VIEWS_FRAME_BIBA_FRAME_PAINT_H_
+ 
++#include <optional>
++
+ #include "third_party/skia/include/core/SkColor.h"
+ 
+ class BrowserView;
+@@ -28,6 +30,11 @@
+                      const views::View* view,
+                      const BrowserView* browser_view);
+ 
++// The active page's colour for the toolbar (Dia: toolbar and page are one
++// card), or nullopt to keep the theme's toolbar colour.
++std::optional<SkColor> SiteToolbarColor(const views::View* view,
++                                        const BrowserView* browser_view);
++
+ // Accent colour of Space `index` (also used by the Space switcher dots).
+ SkColor SpaceAccentColor(int index);
+ 
+--- a/chrome/browser/ui/views/frame/browser_native_widget_mac.mm
++++ b/chrome/browser/ui/views/frame/browser_native_widget_mac.mm
+@@ -38,6 +38,8 @@
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/views/frame/browser_frame_view.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/frame/multi_contents_view.h"
++#include "chrome/browser/ui/views/frame/top_container_view.h"
+ #include "chrome/browser/ui/views/frame/browser_widget.h"
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/web_apps/frame_toolbar/web_app_frame_toolbar_utils.h"
+@@ -236,6 +238,15 @@
+     if (!browser_view_->ShouldDrawTabStrip()) {
+       *titlebar_height += kWebAppMenuMargin * 2;
+     }
++    // Biba (Dia): with the sidebar, the traffic lights sit level with the
++    // toolbar, which is inset from the window top as part of the page card.
++    // They are centred in the titlebar, so make it toolbar + 2 * inset.
++    if (browser_view_->ShouldDrawVerticalTabStrip() &&
++        browser_view_->top_container() &&
++        browser_view_->top_container()->height() > 0) {
++      *titlebar_height = browser_view_->top_container()->height() +
++                         2 * MultiContentsView::kSplitViewContentInset;
++    }
+   } else {
+     *override_titlebar_height = false;
+     *titlebar_height = 0;
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -325,6 +325,10 @@
+       // Keep the regular contents separator below the infobar.
+       info.multi_contents_separator = !suppress_separator;
+       info.top_container_separator = !suppress_separator && has_infobar;
++      // Biba (Dia): toolbar and page are one card; no line between them.
++      if (layout_data_->tab_strip_type == TabStripType::kVertical) {
++        info.multi_contents_separator = has_infobar;
++      }
+       info.side_panel_top_padding = !is_force_to_top;
+       info.adjust_for_missing_separator =
+           suppress_separator && would_have_separator;
+@@ -1311,10 +1315,11 @@
+     top_container_layout.bounds =
+         GetTopContainerBoundsInParent(top_container_local_bounds, params);
+     if (layout_data_->tab_strip_type == TabStripType::kVertical) {
+-      // Biba: the toolbar sits on the frame, level with the traffic lights,
+-      // and its right edge lines up with the content card below.
+-      top_container_layout.bounds.Inset(gfx::Insets::TLBR(
+-          0, 0, 0, MultiContentsView::kSplitViewContentInset));
++      // Biba (Dia): the toolbar is the top of the page card, inset from the
++      // window edge like the rest of the card.
++      top_container_layout.bounds.Inset(
++          gfx::Insets::TLBR(MultiContentsView::kSplitViewContentInset, 0, 0,
++                            MultiContentsView::kSplitViewContentInset));
+     }
+     params.SetTop(top_container_layout.bounds.bottom());
+   }
+--- a/chrome/browser/ui/views/frame/themed_background.cc
++++ b/chrome/browser/ui/views/frame/themed_background.cc
+@@ -116,15 +116,20 @@
+                                        const views::View* view,
+                                        const BrowserView* browser_view,
+                                        ThemeChoice theme_choice) {
+-  // Biba: frame surfaces carry the active Space's colour. The toolbar sits on
+-  // the frame too (Dia layout); only the page below it is a card.
+-  const bool biba_frame_surface =
+-      theme_choice == ThemeChoice::kFrameTheme ||
+-      std::string_view(view->GetClassName()) == "ToolbarView";
+-  if (biba_frame_surface &&
++  // Biba: frame surfaces carry the active Space's colour.
++  if (theme_choice == ThemeChoice::kFrameTheme &&
+       biba::PaintSpaceFrame(canvas, view, browser_view)) {
+     return;
+   }
++  // Biba (Dia): the toolbar is the top of the page card and takes the page's
++  // colour, so toolbar and site read as one surface.
++  if (std::string_view(view->GetClassName()) == "ToolbarView") {
++    if (const std::optional<SkColor> site =
++            biba::SiteToolbarColor(view, browser_view)) {
++      canvas->DrawColor(*site);
++      return;
++    }
++  }
+   bool painted =
+       PaintThemeCustomImage(canvas, view, browser_view, theme_choice);
+   if (!painted) {
+--- a/chrome/browser/ui/views/location_bar/location_bar_view.cc
++++ b/chrome/browser/ui/views/location_bar/location_bar_view.cc
+@@ -187,6 +187,9 @@
+   void TitleWasSet(content::NavigationEntry* entry) override {
+     on_change_.Run();
+   }
++  // The toolbar takes the page's colour (biba/dia-card.patch).
++  void DidChangeThemeColor() override { on_change_.Run(); }
++  void OnBackgroundColorChanged() override { on_change_.Run(); }
+ 
+  private:
+   base::RepeatingClosure on_change_;
+@@ -1158,8 +1161,17 @@
+ 
+   if (WebContents* active = GetWebContents()) {
+     biba_title_watcher_ = std::make_unique<BibaTitleWatcher>(
+-        active, base::BindRepeating(&LocationBarView::RefreshBibaTitle,
+-                                    base::Unretained(this)));
++        active, base::BindRepeating(
++                    [](LocationBarView* self) {
++                      self->RefreshBibaTitle();
++                      if (self->parent()) {
++                        self->parent()->SchedulePaint();
++                      }
++                    },
++                    base::Unretained(this)));
++    if (parent()) {
++      parent()->SchedulePaint();
++    }
+   } else {
+     biba_title_watcher_.reset();
+   }
+--- a/chrome/browser/ui/views/tabs/common/tab_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view.cc
+@@ -382,6 +382,8 @@
+   }
+ 
+   title_->SetProperty(views::kElementIdentifierKey, kVerticalTabTitleElementId);
++  // Biba (Dia): sidebar titles a step larger than the horizontal strip's.
++  title_->SetFontList(title_->font_list().DeriveWithSizeDelta(1));
+   SetProperty(views::kElementIdentifierKey, kTabElementId);
+   // Layout manager must be set after child views are created because the
+   // vertical layout stores pointers to those children.
+--- a/chrome/browser/ui/views/tabs/common/vertical_tab_style_views.cc
++++ b/chrome/browser/ui/views/tabs/common/vertical_tab_style_views.cc
+@@ -225,7 +225,7 @@
+     float alpha = 0.0f;
+     switch (selection_state) {
+       case TabStyle::TabSelectionState::kActive:
+-        alpha = dark ? 0.14f : 0.65f;
++        alpha = dark ? 0.14f : 0.85f;
+         break;
+       case TabStyle::TabSelectionState::kSelected:
+         alpha = dark ? 0.09f : 0.40f;
+--- a/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.cc
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.cc
+@@ -184,8 +184,12 @@
+       base::BindOnce(
+           [](base::WeakPtr<BibaSpaceSwipeHandler> self, int space, float scale,
+              int generation, std::unique_ptr<viz::CopyOutputResult> result) {
++            // Pixels are read a frame later: drop them if the list started
++            // moving (or the Space changed) in between.
+             if (!self || result->IsEmpty() ||
+-                generation != self->snapshot_generation_) {
++                generation != self->snapshot_generation_ || self->tracking_ ||
++                self->offset_ != 0.0f || self->committing_to_ >= 0 ||
++                (self->preview_ && self->preview_->GetVisible())) {
+               return;
+             }
+             auto scoped = result->ScopedAccessSkBitmap();
+@@ -345,16 +349,19 @@
+   if (event->type() != ui::EventType::kScroll) {
+     return;
+   }
++  if (IsGestureStart(*event) && !tracking_) {
++    // A new gesture while the last swipe is still settling: settle it now,
++    // so quick back-and-forth swipes always start from a clean state.
++    FinishPendingSwipe();
++  }
+   if (committing_to_ >= 0) {
+-    // Finishing the previous swipe; swallow its tail.
++    // The released swipe's inertia tail; not a new gesture.
+     if (std::fabs(event->x_offset()) > std::fabs(event->y_offset())) {
+       event->SetHandled();
+     }
+     return;
+   }
+   if (IsGestureStart(*event) && !tracking_) {
+-    // Fresh picture of the list as it is now, for when it slides out.
+-    CaptureSnapshot();
+     BeginTracking();
+   }
+   if (IsGestureRelease(*event)) {
+@@ -499,6 +506,27 @@
+   }
+ }
+ 
++void BibaSpaceSwipeHandler::FinishPendingSwipe() {
++  if (committing_to_ >= 0) {
++    // Jump the motion to its end; SwitchAfterSwipe() runs from OnEnded (or
++    // directly, if the animations had already been dropped).
++    for (views::View* view : MovableViews()) {
++      if (view->layer()) {
++        view->layer()->GetAnimator()->StopAnimating();
++      }
++    }
++    if (preview_ && preview_->layer()) {
++      preview_->layer()->GetAnimator()->StopAnimating();
++    }
++    SwitchAfterSwipe();
++  }
++  if (reveal_timer_.IsRunning()) {
++    reveal_timer_.Stop();
++    SetOffset(0.0f, 1.0f);
++    HidePreview();
++  }
++}
++
+ void BibaSpaceSwipeHandler::SwitchAfterSwipe() {
+   if (committing_to_ < 0) {
+     return;
+--- a/chrome/browser/ui/views/tabs/vertical/biba_space_menu_button.cc
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_menu_button.cc
+@@ -16,6 +16,11 @@
+ #include "ui/base/ui_base_types.h"
+ #include "ui/events/keycodes/keyboard_codes.h"
+ #include "ui/gfx/canvas.h"
++#include "ui/gfx/text_utils.h"
++#include "ui/gfx/font_list.h"
++#include "ui/gfx/color_utils.h"
++#include "ui/color/color_provider.h"
++#include "ui/color/color_id.h"
+ #include "ui/gfx/image/canvas_image_source.h"
+ #include "ui/gfx/image/image_skia.h"
+ #include "ui/base/mojom/menu_source_type.mojom.h"
+@@ -50,6 +55,26 @@
+   const SkColor color_;
+ };
+ 
++// The Space's name in its colour (Dia shows the profile name here).
++class NameSource : public gfx::CanvasImageSource {
++ public:
++  NameSource(std::u16string text, gfx::FontList font, SkColor color)
++      : gfx::CanvasImageSource(
++            gfx::Size(gfx::GetStringWidth(text, font), font.GetHeight())),
++        text_(std::move(text)),
++        font_(std::move(font)),
++        color_(color) {}
++
++  void Draw(gfx::Canvas* canvas) override {
++    canvas->DrawStringRect(text_, font_, color_, gfx::Rect(size()));
++  }
++
++ private:
++  const std::u16string text_;
++  const gfx::FontList font_;
++  const SkColor color_;
++};
++
+ ui::ImageModel Dot(SkColor color, int size) {
+   return ui::ImageModel::FromImageSkia(
+       gfx::ImageSkia(std::make_unique<DotSource>(color, size),
+@@ -81,8 +106,29 @@
+ void BibaSpaceMenuButton::UpdateIcon() {
+   const auto* commands = chrome::BrowserCommandController::From(browser_);
+   const int active = commands ? commands->biba_active_space() : 0;
+-  SetImageModel(STATE_NORMAL,
+-                Dot(biba::SpaceAccentColor(active), kButtonDot));
++  // Dia: the current Space's name, in a deep shade of its colour.
++  const SkColor accent = biba::SpaceAccentColor(active);
++  const bool dark = GetColorProvider() &&
++                    color_utils::IsDark(
++                        GetColorProvider()->GetColor(ui::kColorSysSurface));
++  const SkColor text_color = color_utils::AlphaBlend(
++      accent, dark ? SK_ColorWHITE : SK_ColorBLACK, dark ? 0.55f : 0.6f);
++  const gfx::FontList font = gfx::FontList().DeriveWithSizeDelta(2).DeriveWithWeight(
++      gfx::Font::Weight::SEMIBOLD);
++  auto source = std::make_unique<NameSource>(
++      u"Space " + base::NumberToString16(active + 1), font, text_color);
++  const gfx::Size size = source->size();
++  SetImageModel(STATE_NORMAL, ui::ImageModel::FromImageSkia(
++                                  gfx::ImageSkia(std::move(source), size)));
++  SetPreferredSize(gfx::Size(size.width() + 8, kButtonSize));
++  if (parent()) {
++    parent()->InvalidateLayout();
++  }
++}
++
++void BibaSpaceMenuButton::OnThemeChanged() {
++  views::ImageButton::OnThemeChanged();
++  UpdateIcon();
+ }
+ 
+ void BibaSpaceMenuButton::ShowMenu() {
+--- a/chrome/browser/ui/views/tabs/vertical/biba_space_menu_button.h
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_menu_button.h
+@@ -32,6 +32,9 @@
+   BibaSpaceMenuButton& operator=(const BibaSpaceMenuButton&) = delete;
+   ~BibaSpaceMenuButton() override;
+ 
++  // views::View:
++  void OnThemeChanged() override;
++
+   // ui::SimpleMenuModel::Delegate:
+   bool IsCommandIdChecked(int command_id) const override;
+   void ExecuteCommand(int command_id, int event_flags) override;
+--- a/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.h
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.h
+@@ -78,6 +78,8 @@
+   // expensive tab re-parenting never stalls the animation.
+   void CommitSwipe(int target, int direction);
+   void SwitchAfterSwipe();
++  // Brings a released swipe (motion and swap-in) to its end immediately.
++  void FinishPendingSwipe();
+   // Moves the movable views by `offset` DIPs horizontally (no animation).
+   void SetOffset(float offset, float opacity);
+   // Animates the movable views from their current offset to rest.

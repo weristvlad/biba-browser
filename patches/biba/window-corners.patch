@@ -1,0 +1,14 @@
+--- a/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm
++++ b/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm
+@@ -89,7 +89,10 @@
+ // methods (-_topCornerSize, -_bottomCornerSize) also depend on
+ // _getCachedWindowCornerRadius.
+ - (CGFloat)_getCachedWindowCornerRadius {
+-  if (@available(macOS 26, *)) {
++  // Biba: keep AppKit's own radius. Forcing a smaller one makes the content
++  // mask disagree with the window's edge highlight, which AppKit still draws
++  // at its default radius: a double arc in every corner.
++  if ((false)) {
+     return 10.0 /* widget position from top and left */ +
+            7.0 /* widget radius */;
+   }

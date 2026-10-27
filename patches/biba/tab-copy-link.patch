@@ -1,0 +1,227 @@
+--- a/chrome/browser/ui/views/tabs/common/tab_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view.cc
+@@ -4,6 +4,12 @@
+ 
+ #include "chrome/browser/ui/views/tabs/common/tab_view.h"
+ 
++#include "chrome/app/vector_icons/vector_icons.h"
++#include "components/vector_icons/vector_icons.h"
++#include "ui/base/clipboard/scoped_clipboard_writer.h"
++#include "ui/base/models/image_model.h"
++#include "ui/views/controls/button/image_button.h"
++#include "base/strings/utf_string_conversions.h"
+ #include <optional>
+ #include <string>
+ 
+@@ -335,6 +341,17 @@
+                                   this,
+                                   kGlowHoverAnimationDuration)
+                             : nullptr) {
++  biba_copy_link_button_ = AddChildView(std::make_unique<views::ImageButton>(
++      base::BindRepeating(&TabView::BibaCopyLinkPressed,
++                          base::Unretained(this))));
++  biba_copy_link_button_->SetTooltipText(u"Copy link");
++  biba_copy_link_button_->GetViewAccessibility().SetName(u"Copy link");
++  biba_copy_link_button_->SetImageHorizontalAlignment(
++      views::ImageButton::ALIGN_CENTER);
++  biba_copy_link_button_->SetImageVerticalAlignment(
++      views::ImageButton::ALIGN_MIDDLE);
++  biba_copy_link_button_->SetVisible(false);
++
+   tabs::TabInterface* tab = const_cast<tabs::TabInterface*>(GetTabInterface());
+   BrowserWindowInterface* browser_window = tab->GetBrowserWindowInterface();
+ 
+@@ -1253,6 +1270,8 @@
+   TabStyle::TabColors colors = tab_styling()->CalculateTargetColors();
+   title_->SetEnabledColor(colors.foreground_color);
+   close_button_->SetColors(colors);
++  biba_icon_color_ = colors.foreground_color;
++  BibaUpdateCopyLinkIcon(biba_copied_timer_.IsRunning());
+   alert_indicator_->OnParentTabButtonColorChanged();
+ 
+   UpdateBorder();
+@@ -1270,6 +1289,37 @@
+   radial_highlight_opacity_ = radial_highlight_opacity;
+ }
+ 
++void TabView::BibaCopyLinkPressed() {
++  const tabs::TabInterface* tab = GetTabInterface();
++  if (!tab || !tab->GetContents()) {
++    return;
++  }
++  const GURL& url = tab->GetContents()->GetVisibleURL();
++  if (!url.is_valid()) {
++    return;
++  }
++  ui::ScopedClipboardWriter(ui::ClipboardBuffer::kCopyPaste)
++      .WriteText(base::UTF8ToUTF16(url.spec()));
++  // Static confirmation: the icon turns into a check for a moment.
++  BibaUpdateCopyLinkIcon(/*copied=*/true);
++  biba_copied_timer_.Start(
++      FROM_HERE, base::Milliseconds(1200),
++      base::BindOnce(&TabView::BibaUpdateCopyLinkIcon, base::Unretained(this),
++                     /*copied=*/false));
++}
++
++void TabView::BibaUpdateCopyLinkIcon(bool copied) {
++  if (!biba_copy_link_button_) {
++    return;
++  }
++  constexpr int kBibaCopyIconSize = 14;
++  biba_copy_link_button_->SetImageModel(
++      views::Button::STATE_NORMAL,
++      ui::ImageModel::FromVectorIcon(
++          copied ? kCheckIcon : vector_icons::kLinkIcon, biba_icon_color_,
++          kBibaCopyIconSize));
++}
++
+ void TabView::CloseButtonPressed(const ui::Event& event) {
+   CHECK(collection_node_);
+ 
+--- a/chrome/browser/ui/views/tabs/common/tab_view.h
++++ b/chrome/browser/ui/views/tabs/common/tab_view.h
+@@ -21,6 +21,7 @@
+ #include "chrome/browser/ui/views/tabs/tab/tab_context_menu_controller.h"
+ #include "chrome/common/buildflags.h"
+ #include "components/performance_manager/public/freezing/freezing.h"
++#include "base/timer/timer.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "third_party/skia/include/core/SkScalar.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+@@ -203,6 +204,10 @@
+ 
+   bool IsDragging() const;
+ 
++  // Biba: copy-link button.
++  void BibaCopyLinkPressed();
++  void BibaUpdateCopyLinkIcon(bool copied);
++
+   static int UncollapsedMinWidth();
+   static int CollapsedWidth();
+ 
+@@ -226,6 +231,10 @@
+   const raw_ptr<TabIcon> icon_;
+   const raw_ptr<AlertIndicatorButton> alert_indicator_;
+   const raw_ptr<TabCloseButton> close_button_;
++  // Biba: shown next to the close button on hover; copies the tab's URL.
++  raw_ptr<views::ImageButton> biba_copy_link_button_ = nullptr;
++  base::OneShotTimer biba_copied_timer_;
++  SkColor biba_icon_color_ = SK_ColorTRANSPARENT;
+   raw_ptr<glic::TabUnderlineView> glic_tab_underline_view_ = nullptr;
+ 
+   base::CallbackListSubscription node_destroyed_subscription_;
+--- a/chrome/browser/ui/views/tabs/common/tab_view_vertical_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view_vertical_layout.cc
+@@ -32,6 +32,11 @@
+       TabChildConfig(TabView().close_button_, kIconDesignWidth, kDefaultPadding,
+                      /*align_leading=*/false,
+                      /*expand=*/false),
++      // Biba: copy-link sits just before the close button.
++      TabChildConfig(TabView().biba_copy_link_button_, kIconDesignWidth,
++                     kDefaultPadding,
++                     /*align_leading=*/false,
++                     /*expand=*/false),
+       TabChildConfig(TabView().icon_, kIconDesignWidth, kHorizontalInset,
+                      /*align_leading=*/true,
+                      /*expand=*/false),
+@@ -168,6 +173,16 @@
+            !IsChildVisible(TabView().alert_indicator_, width);
+   }
+ 
++  if (child_view == TabView().biba_copy_link_button_) {
++    // Hover-only, and only once the strip is wide enough to show titles.
++    const bool hovered_or_focused =
++        TabView().hovered_ ||
++        (TabView().biba_copy_link_button_ &&
++         TabView().biba_copy_link_button_->HasFocus());
++    return !TabView().pinned_ && hovered_or_focused &&
++           width >= TabView().UncollapsedMinWidth();
++  }
++
+   if (child_view == TabView().close_button_) {
+     if (TabView().pinned_) {
+       return false;
+--- a/chrome/browser/ui/biba/biba_spaces_controller.cc
++++ b/chrome/browser/ui/biba/biba_spaces_controller.cc
+@@ -20,6 +20,9 @@
+ #include "ui/base/base_window.h"
+ #include "ui/gfx/geometry/rect.h"
+ #include "ui/snapshot/snapshot.h"
++#include <string_view>
++#include "ui/views/controls/button/image_button.h"
++#include "ui/events/event.h"
+ #include "ui/views/view.h"
+ #include "ui/views/widget/widget.h"
+ #include "chrome/browser/ui/tabs/tab_model.h"
+@@ -135,10 +138,19 @@
+ }
+ 
+ void BibaDumpViewsAt(BrowserWindowInterface* browser, int x, int y);
++void BibaPokeFirstTab(BrowserWindowInterface* browser, bool click_copy);
+ 
+ void BibaSpacesController::SelfTestStep(int step) {
+   if (step == 0) {
+-    BibaDumpViewsAt(debug_browser_, 1396, 400);
++    BibaPokeFirstTab(debug_browser_, /*click_copy=*/false);
++  }
++  if (step == 4) {
++    BibaPokeFirstTab(debug_browser_, /*click_copy=*/false);
++    base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++        FROM_HERE,
++        base::BindOnce(&BibaPokeFirstTab, debug_browser_.get(),
++                       /*click_copy=*/true),
++        base::Milliseconds(600));
+   }
+   // 0: initial, 1: -> Space 2 (fresh), 2: -> Space 1, 3: -> Space 2 again,
+   // 4: -> Space 1 again.
+@@ -241,3 +253,50 @@
+     }
+   }
+ }
++
++// DEBUG: hovers the first sidebar tab; optionally clicks its copy-link button.
++void BibaPokeFirstTab(BrowserWindowInterface* browser, bool click_copy) {
++  if (!browser || !browser->GetWindow()) {
++    return;
++  }
++  views::Widget* widget = views::Widget::GetWidgetForNativeWindow(
++      browser->GetWindow()->GetNativeWindow());
++  if (!widget) {
++    return;
++  }
++  std::vector<views::View*> stack = {widget->GetRootView()};
++  while (!stack.empty()) {
++    views::View* view = stack.back();
++    stack.pop_back();
++    if (std::string_view(view->GetClassName()) == "TabView") {
++      const gfx::Point center = view->GetLocalBounds().CenterPoint();
++      ui::MouseEvent enter(ui::EventType::kMouseEntered, center, center,
++                           base::TimeTicks::Now(), 0, 0);
++      view->OnMouseEntered(enter);
++      if (click_copy) {
++        for (views::View* child : view->children()) {
++          auto* button = views::AsViewClass<views::ImageButton>(child);
++          if (button && button->GetVisible() &&
++              button->GetTooltipText() == u"Copy link") {
++            const gfx::Point c = button->GetLocalBounds().CenterPoint();
++            ui::MouseEvent press(ui::EventType::kMousePressed, c, c,
++                                 base::TimeTicks::Now(),
++                                 ui::EF_LEFT_MOUSE_BUTTON,
++                                 ui::EF_LEFT_MOUSE_BUTTON);
++            ui::MouseEvent release(ui::EventType::kMouseReleased, c, c,
++                                   base::TimeTicks::Now(),
++                                   ui::EF_LEFT_MOUSE_BUTTON,
++                                   ui::EF_LEFT_MOUSE_BUTTON);
++            button->OnMousePressed(press);
++            button->OnMouseReleased(release);
++            LOG(ERROR) << "[biba-selftest] clicked copy link";
++          }
++        }
++      }
++      return;
++    }
++    for (views::View* child : view->children()) {
++      stack.push_back(child);
++    }
++  }
++}

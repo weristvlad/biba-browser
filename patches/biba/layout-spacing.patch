@@ -1,0 +1,50 @@
+--- a/chrome/browser/ui/views/frame/multi_contents_view.h
++++ b/chrome/browser/ui/views/frame/multi_contents_view.h
+@@ -62,7 +62,8 @@
+     int end = 0;
+   };
+ 
+-  static constexpr int kSplitViewContentInset = 3;
++  // Biba: Dia-like air around the content card (was 3).
++  static constexpr int kSplitViewContentInset = 8;
+ 
+   MultiContentsView(BrowserView* browser_view,
+                     std::unique_ptr<MultiContentsViewDelegate> delegate);
+--- a/chrome/browser/ui/biba/biba_spaces_controller.cc
++++ b/chrome/browser/ui/biba/biba_spaces_controller.cc
+@@ -138,7 +138,7 @@
+ 
+ void BibaSpacesController::SelfTestStep(int step) {
+   if (step == 0) {
+-    BibaDumpViewsAt(debug_browser_, 30, 20);
++    BibaDumpViewsAt(debug_browser_, 1396, 400);
+   }
+   // 0: initial, 1: -> Space 2 (fresh), 2: -> Space 1, 3: -> Space 2 again,
+   // 4: -> Space 1 again.
+--- a/chrome/browser/ui/views/frame/multi_contents_background_view.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_background_view.cc
+@@ -52,7 +52,10 @@
+   if (helium::ShouldUseNativeFrameMaterials(browser_view_)) {
+     return;
+   }
+-  ThemedBackground::PaintBackground(canvas, this, browser_view_);
++  // Biba: the area around (and between) content cards is window frame, tinted
++  // with the active Space.
++  ThemedBackground::PaintBackground(canvas, this, browser_view_,
++                                    ThemedBackground::ThemeChoice::kFrameTheme);
+ }
+ 
+ ui::LayerType MultiContentsBackgroundView::CalculateLayerType() const {
+@@ -60,8 +63,10 @@
+       !ThemedBackground::GetBackgroundColor(this, browser_view_).has_value();
+   const bool use_native_materials =
+       helium::ShouldUseNativeFrameMaterials(browser_view_);
+-  return has_custom_image || use_native_materials ? ui::LAYER_TEXTURED
+-                                                 : ui::LAYER_SOLID_COLOR;
++  // Biba: always textured, the frame gradient can't be a solid colour layer.
++  (void)has_custom_image;
++  (void)use_native_materials;
++  return ui::LAYER_TEXTURED;
+ }
+ 
+ void MultiContentsBackgroundView::UpdateSolidLayerColor() {

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# quilt wrapper for the Biba/Helium tree: ./q push|pop|new|add|refresh|top|series ...
+# Runs inside build/src with Helium's merged series (which also lists Biba's patches).
+H=${BIBA_HELIUM:-/Volumes/BibaBuild/biba/helium-macos}
+export QUILT_PATCHES="$H/patches" QUILT_SERIES=series.merged
+export QUILT_PATCH_OPTS="--unified --reject-format=unified"
+export QUILT_REFRESH_ARGS="-p ab --no-timestamps --no-index"
+export QUILT_DIFF_ARGS="-p ab --no-timestamps --no-index"
+cd "$H/build/src" || exit 1
+exec quilt --quiltrc - "$@"

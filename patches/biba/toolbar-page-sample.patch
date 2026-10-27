@@ -1,0 +1,467 @@
+--- a/chrome/browser/ui/views/frame/BUILD.gn
++++ b/chrome/browser/ui/views/frame/BUILD.gn
+@@ -856,6 +856,8 @@
+     "//base",
+     "//cc/paint",
+     "//chrome/browser/ui:browser_command_controller",
++    "//components/viz/common",
++    "//content/public/browser",
+     "//skia",
+     "//ui/color",
+     "//ui/gfx",
+--- a/chrome/browser/ui/views/frame/biba_frame_paint.cc
++++ b/chrome/browser/ui/views/frame/biba_frame_paint.cc
+@@ -8,8 +8,20 @@
+ #include <array>
+ #include <cstdint>
+ #include <utility>
++#include <string_view>
++#include <map>
+ 
+ #include "base/no_destructor.h"
++#include "url/gurl.h"
++#include "ui/views/view_tracker.h"
++#include "ui/views/biba_color_override.h"
++#include "ui/color/color_provider_manager.h"
++#include "ui/color/color_provider_key.h"
++#include "content/public/browser/render_widget_host_view.h"
++#include "components/viz/common/frame_sinks/copy_output_result.h"
++#include "base/functional/bind.h"
++#include "base/time/time.h"
++#include "base/supports_user_data.h"
+ #include "chrome/browser/ui/browser_command_controller.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "ui/gfx/scoped_canvas.h"
+@@ -159,6 +171,133 @@
+   canvas->sk_canvas()->drawRRect(rrect, edge);
+ }
+ 
++
++// Colour of the top of the rendered page, per WebContents.
++struct PageTopSample : public base::SupportsUserData::Data {
++  std::optional<SkColor> color;
++  GURL url;
++  base::TimeTicks time;
++  bool pending = false;
++  // What the toolbar was last painted with, to skip needless repaints.
++  std::optional<SkColor> applied;
++};
++const char kPageTopSampleKey[] = "biba-page-top-sample";
++
++PageTopSample* GetSample(content::WebContents* contents, bool create) {
++  auto* sample =
++      static_cast<PageTopSample*>(contents->GetUserData(kPageTopSampleKey));
++  if (!sample && create) {
++    auto owned = std::make_unique<PageTopSample>();
++    sample = owned.get();
++    contents->SetUserData(kPageTopSampleKey, std::move(owned));
++  }
++  return sample;
++}
++
++// The most common colour along a row of pixels (headers are flat colours;
++// a logo or text in the strip shouldn't win).
++std::optional<SkColor> DominantColor(const SkBitmap& bitmap) {
++  if (bitmap.drawsNothing() || bitmap.width() == 0) {
++    return std::nullopt;
++  }
++  std::map<SkColor, int> counts;
++  for (int y = 0; y < bitmap.height(); ++y) {
++    for (int x = 0; x < bitmap.width(); ++x) {
++      const SkColor c = bitmap.getColor(x, y);
++      // Bucket to 4 bits per channel so anti-aliasing noise doesn't split it.
++      const SkColor bucket = SkColorSetRGB(SkColorGetR(c) & 0xF0,
++                                           SkColorGetG(c) & 0xF0,
++                                           SkColorGetB(c) & 0xF0);
++      ++counts[bucket];
++    }
++  }
++  SkColor best_bucket = SK_ColorWHITE;
++  int best = -1;
++  for (const auto& [bucket, count] : counts) {
++    if (count > best) {
++      best = count;
++      best_bucket = bucket;
++    }
++  }
++  // Return a real pixel from the winning bucket, not the bucket itself.
++  for (int x = 0; x < bitmap.width(); ++x) {
++    const SkColor c = bitmap.getColor(x, 0);
++    if (SkColorSetRGB(SkColorGetR(c) & 0xF0, SkColorGetG(c) & 0xF0,
++                      SkColorGetB(c) & 0xF0) == best_bucket) {
++      return SkColorSetA(c, SK_AlphaOPAQUE);
++    }
++  }
++  return SkColorSetA(best_bucket, SK_AlphaOPAQUE);
++}
++
++// Samples the top strip of the page, at most about once a second per tab.
++void MaybeSamplePageTop(content::WebContents* contents, views::View* toolbar) {
++  if (!contents) {
++    return;
++  }
++  content::RenderWidgetHostView* rwhv = contents->GetRenderWidgetHostView();
++  if (!rwhv || !rwhv->IsSurfaceAvailableForCopy()) {
++    return;
++  }
++  PageTopSample* sample = GetSample(contents, /*create=*/true);
++  const base::TimeTicks now = base::TimeTicks::Now();
++  if (sample->pending || (sample->url == contents->GetVisibleURL() &&
++                          now - sample->time < base::Milliseconds(100))) {
++    return;
++  }
++  sample->pending = true;
++  const gfx::Size size = rwhv->GetViewBounds().size();
++  if (size.IsEmpty()) {
++    sample->pending = false;
++    return;
++  }
++  auto tracker = std::make_unique<views::ViewTracker>(toolbar);
++  rwhv->CopyFromSurface(
++      gfx::Rect(0, 0, size.width(), 2), gfx::Size(64, 1), base::Seconds(1),
++      base::BindOnce(
++          [](base::WeakPtr<content::WebContents> contents,
++             std::unique_ptr<views::ViewTracker> tracker, GURL url,
++             const content::CopyFromSurfaceResult& result) {
++            if (!contents) {
++              return;
++            }
++            PageTopSample* sample = GetSample(contents.get(), true);
++            sample->pending = false;
++            sample->time = base::TimeTicks::Now();
++            sample->url = url;
++            if (result.has_value()) {
++              if (std::optional<SkColor> color =
++                      DominantColor(result->bitmap)) {
++                sample->color = color;
++              }
++            }
++            if (views::View* toolbar = tracker->view()) {
++              MatchToolbarToPage(toolbar, contents.get());
++            }
++          },
++          contents->GetWeakPtr(), std::move(tracker),
++          contents->GetVisibleURL()));
++}
++
++// The measured colour when it belongs to the page now shown; otherwise the
++// page's declared theme colour or background.
++std::optional<SkColor> PageTopColor(content::WebContents* contents) {
++  if (!contents) {
++    return std::nullopt;
++  }
++  if (PageTopSample* sample = GetSample(contents, /*create=*/false);
++      sample && sample->color && sample->url == contents->GetVisibleURL()) {
++    return sample->color;
++  }
++  std::optional<SkColor> site = contents->GetThemeColor();
++  if (!site) {
++    site = contents->GetBackgroundColor();
++  }
++  if (!site || SkColorGetA(*site) != SK_AlphaOPAQUE) {
++    return std::nullopt;
++  }
++  return site;
++}
+ }  // namespace
+ 
+ SkColor SpaceAccentColor(int index) {
+@@ -232,25 +371,56 @@
+ 
+ std::optional<SkColor> SiteToolbarColor(const views::View* view,
+                                         const BrowserView* browser_view) {
+-  if (!browser_view || !browser_view->GetIsNormalType() ||
+-      !view->GetColorProvider()) {
++  if (!browser_view || !browser_view->GetIsNormalType()) {
+     return std::nullopt;
+   }
+-  content::WebContents* contents =
+-      const_cast<BrowserView*>(browser_view)->GetActiveWebContents();
+-  if (!contents) {
+-    return std::nullopt;
++  return PageTopColor(
++      const_cast<BrowserView*>(browser_view)->GetActiveWebContents());
++}
++
++void MatchToolbarToPage(views::View* location_bar,
++                        content::WebContents* contents) {
++  views::View* toolbar = location_bar;
++  while (toolbar &&
++         std::string_view(toolbar->GetClassName()) != "ToolbarView") {
++    toolbar = toolbar->parent();
+   }
+-  std::optional<SkColor> site = contents->GetThemeColor();
+-  if (!site) {
+-    site = contents->GetBackgroundColor();
++  views::Widget* widget = location_bar ? location_bar->GetWidget() : nullptr;
++  if (!toolbar || !widget || !widget->GetColorProvider()) {
++    return;
+   }
+-  if (!site || SkColorGetA(*site) != SK_AlphaOPAQUE) {
+-    return std::nullopt;
++  MaybeSamplePageTop(contents, toolbar);
++
++  const ui::ColorProvider* override = nullptr;
++  if (const std::optional<SkColor> site = PageTopColor(contents)) {
++    const bool window_dark = color_utils::IsDark(
++        widget->GetColorProvider()->GetColor(kColorToolbar));
++    const bool page_dark = color_utils::IsDark(*site);
++    if (page_dark != window_dark) {
++      ui::ColorProviderKey key = widget->GetColorProviderKeyForTesting();
++      key.color_mode = page_dark ? ui::ColorProviderKey::ColorMode::kDark
++                                 : ui::ColorProviderKey::ColorMode::kLight;
++      override = ui::ColorProviderManager::Get().GetColorProviderFor(key);
++    }
++  }
++  bool changed = false;
++  if (override != views::GetBibaColorProviderOverride(toolbar)) {
++    views::SetBibaColorProviderOverride(toolbar, override);
++    // Buttons cache colours when the theme changes; let them re-read.
++    widget->ThemeChanged();
++    changed = true;
++  }
++  if (contents) {
++    PageTopSample* sample = GetSample(contents, /*create=*/true);
++    const std::optional<SkColor> now_color = PageTopColor(contents);
++    if (sample->applied != now_color) {
++      sample->applied = now_color;
++      changed = true;
++    }
++  }
++  if (changed) {
++    toolbar->SchedulePaint();
+   }
+-  // The toolbar's icons and text switch to dark/light colours to match
+-  // (LocationBarView gives the toolbar a matching ColorProvider).
+-  return site;
+ }
+ 
+ }  // namespace biba
+--- a/chrome/browser/ui/views/frame/biba_frame_paint.h
++++ b/chrome/browser/ui/views/frame/biba_frame_paint.h
+@@ -11,6 +11,10 @@
+ 
+ class BrowserView;
+ 
++namespace content {
++class WebContents;
++}
++
+ namespace gfx {
+ class Canvas;
+ }
+@@ -30,6 +34,14 @@
+                      const views::View* view,
+                      const BrowserView* browser_view);
+ 
++// Dia: the toolbar takes the colour of the top of the page, measured from
++// the rendered page (a site's declared theme-color is only a fallback). Call
++// whenever the page may have changed (loads, theme colour, tab switch): it
++// re-samples (throttled) and switches the toolbar's icons and text to dark or
++// light colours to match. `location_bar` is any view inside the toolbar.
++void MatchToolbarToPage(views::View* location_bar,
++                        content::WebContents* contents);
++
+ // The active page's colour for the toolbar (Dia: toolbar and page are one
+ // card), or nullopt to keep the theme's toolbar colour.
+ std::optional<SkColor> SiteToolbarColor(const views::View* view,
+--- a/chrome/browser/ui/views/location_bar/BUILD.gn
++++ b/chrome/browser/ui/views/location_bar/BUILD.gn
+@@ -80,6 +80,7 @@
+     "//chrome/browser/ui/dialogs",
+     "//chrome/browser/ui/select_file_policy",
+     "//chrome/browser/ui/views/frame:browser_view_header",
++    "//chrome/browser/ui/views/frame:biba_frame_paint",
+   ]
+ 
+   if (toolkit_views) {
+--- a/chrome/browser/ui/views/location_bar/location_bar_view.cc
++++ b/chrome/browser/ui/views/location_bar/location_bar_view.cc
+@@ -3,6 +3,13 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/ui/views/location_bar/location_bar_view.h"
++#include "chrome/browser/ui/views/frame/biba_frame_paint.h"
++#include "base/timer/timer.h"
++#include "third_party/blink/public/common/input/web_input_event.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/render_widget_host_observer.h"
++#include "content/public/browser/render_widget_host.h"
++#include "content/public/browser/navigation_handle.h"
+ #include "ui/gfx/color_utils.h"
+ #include "ui/color/color_provider_key.h"
+ #include "ui/color/color_provider_manager.h"
+@@ -182,62 +189,124 @@
+ #endif
+ 
+ // Biba: tells the location bar when the page title changes.
+-class BibaTitleWatcher : public content::WebContentsObserver {
++class BibaTitleWatcher : public content::WebContentsObserver,
++                         public content::RenderWidgetHost::InputEventObserver,
++                         public content::RenderWidgetHostObserver {
+  public:
+   BibaTitleWatcher(content::WebContents* contents,
+-                   base::RepeatingClosure on_change)
++                   base::RepeatingClosure on_change,
++                   base::RepeatingClosure on_tick = {})
+       : content::WebContentsObserver(contents),
+-        on_change_(std::move(on_change)) {}
++        on_change_(std::move(on_change)),
++        on_settle_(std::move(on_tick)) {
++    if (content::RenderFrameHost* frame = contents->GetPrimaryMainFrame()) {
++      ObserveWidget(frame->GetRenderWidgetHost());
++    }
++  }
++  ~BibaTitleWatcher() override { ObserveWidget(nullptr); }
++
+   void TitleWasSet(content::NavigationEntry* entry) override {
+     on_change_.Run();
+   }
+   // The toolbar takes the page's colour (biba/dia-card.patch).
+   void DidChangeThemeColor() override { on_change_.Run(); }
+   void OnBackgroundColorChanged() override { on_change_.Run(); }
++  // The page's look settles after loading (banners close, fonts arrive):
++  // measure its top again a little later. Only around loads and scrolling,
++  // never on a timer, so a modal dimming the page doesn't drag the toolbar
++  // along.
++  void DidStopLoading() override {
++    on_change_.Run();
++    ScheduleSettle();
++  }
++  void DidFirstVisuallyNonEmptyPaint() override {
++    on_change_.Run();
++    ScheduleSettle();
++  }
++  // Single-page apps navigate without loading.
++  void DidFinishNavigation(content::NavigationHandle* handle) override {
++    if (handle->IsInPrimaryMainFrame() && handle->HasCommitted()) {
++      ScheduleSettle();
++    }
++  }
++  void RenderFrameHostChanged(content::RenderFrameHost* old_host,
++                              content::RenderFrameHost* new_host) override {
++    if (new_host && new_host->IsInPrimaryMainFrame()) {
++      ObserveWidget(new_host->GetRenderWidgetHost());
++    }
++  }
++
++  // content::RenderWidgetHost::InputEventObserver: sticky headers change
++  // colour as the page scrolls (GitHub turns black); follow while scrolling
++  // and once more when it stops.
++  void OnInputEvent(const content::RenderWidgetHost& host,
++                    const blink::WebInputEvent& event,
++                    InputEventSource source) override {
++    switch (event.GetType()) {
++      case blink::WebInputEvent::Type::kMouseWheel:
++      case blink::WebInputEvent::Type::kGestureScrollUpdate:
++      case blink::WebInputEvent::Type::kGestureScrollEnd:
++      case blink::WebInputEvent::Type::kRawKeyDown:
++        break;
++      default:
++        return;
++    }
++    if (!on_settle_) {
++      return;
++    }
++    scroll_stop_.Start(FROM_HERE, base::Milliseconds(120), on_settle_);
++    if (!scroll_tick_.IsRunning()) {
++      scroll_tick_.Start(FROM_HERE, base::Milliseconds(200), on_settle_);
++    }
++  }
++
++  // content::RenderWidgetHostObserver:
++  void RenderWidgetHostDestroyed(content::RenderWidgetHost* host) override {
++    if (host == widget_) {
++      ObserveWidget(nullptr);
++    }
++  }
+ 
+  private:
++  void ObserveWidget(content::RenderWidgetHost* widget) {
++    if (widget_ == widget) {
++      return;
++    }
++    if (widget_) {
++      widget_->RemoveInputEventObserver(this);
++      widget_->RemoveObserver(this);
++    }
++    widget_ = widget;
++    if (widget_) {
++      widget_->AddInputEventObserver(this);
++      widget_->AddObserver(this);
++    }
++  }
++
++  void ScheduleSettle() {
++    if (!on_settle_) {
++      return;
++    }
++    settle_early_.Start(FROM_HERE, base::Milliseconds(600), on_settle_);
++    settle_late_.Start(FROM_HERE, base::Seconds(2), on_settle_);
++    settle_final_.Start(FROM_HERE, base::Seconds(5), on_settle_);
++  }
++
+   base::RepeatingClosure on_change_;
++  base::RepeatingClosure on_settle_;
++  base::OneShotTimer settle_early_;
++  base::OneShotTimer settle_late_;
++  base::OneShotTimer settle_final_;
++  base::OneShotTimer scroll_stop_;
++  base::OneShotTimer scroll_tick_;
++  raw_ptr<content::RenderWidgetHost> widget_ = nullptr;
+ };
+ 
+ namespace {
+ 
+-// Biba (Dia): the toolbar takes the page's colour; over a page darker or
+-// lighter than the window theme, the toolbar's icons and text switch to the
+-// matching dark/light colours, the rest of the window keeps its own.
++// Biba (Dia): the toolbar takes the page's colour (biba_frame_paint.h).
+ void BibaMatchToolbarToPage(LocationBarView* location_bar) {
+-  views::View* toolbar = location_bar->parent();
+-  while (toolbar &&
+-         std::string_view(toolbar->GetClassName()) != "ToolbarView") {
+-    toolbar = toolbar->parent();
+-  }
+-  views::Widget* widget = location_bar->GetWidget();
+-  if (!toolbar || !widget || !widget->GetColorProvider()) {
+-    return;
+-  }
+-  const ui::ColorProvider* override = nullptr;
+-  content::WebContents* contents = location_bar->GetWebContents();
+-  std::optional<SkColor> site =
+-      contents ? contents->GetThemeColor() : std::nullopt;
+-  if (!site && contents) {
+-    site = contents->GetBackgroundColor();
+-  }
+-  if (site && SkColorGetA(*site) == SK_AlphaOPAQUE) {
+-    const bool window_dark = color_utils::IsDark(
+-        widget->GetColorProvider()->GetColor(kColorToolbar));
+-    const bool page_dark = color_utils::IsDark(*site);
+-    if (page_dark != window_dark) {
+-      ui::ColorProviderKey key = widget->GetColorProviderKeyForTesting();
+-      key.color_mode = page_dark ? ui::ColorProviderKey::ColorMode::kDark
+-                                 : ui::ColorProviderKey::ColorMode::kLight;
+-      override = ui::ColorProviderManager::Get().GetColorProviderFor(key);
+-    }
+-  }
+-  if (override != views::GetBibaColorProviderOverride(toolbar)) {
+-    views::SetBibaColorProviderOverride(toolbar, override);
+-    // Buttons cache colours when the theme changes; let them re-read.
+-    widget->ThemeChanged();
+-  }
+-  toolbar->SchedulePaint();
++  biba::MatchToolbarToPage(location_bar, location_bar->GetWebContents());
+ }
+ 
+ // Biba (Dia): at rest the address is plain text, no site-info icon; it comes
+@@ -1223,7 +1292,8 @@
+                       self->RefreshBibaTitle();
+                       BibaMatchToolbarToPage(self);
+                     },
+-                    base::Unretained(this)));
++                    base::Unretained(this)),
++        base::BindRepeating(&BibaMatchToolbarToPage, base::Unretained(this)));
+     BibaMatchToolbarToPage(this);
+   } else {
+     biba_title_watcher_.reset();

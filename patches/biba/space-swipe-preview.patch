@@ -1,0 +1,508 @@
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -736,6 +736,7 @@
+       "//components/media_router/common",
+       "//components/paint_preview/buildflags",
+       "//components/password_manager/core/browser",
++      "//components/favicon/content",
+       "//components/performance_manager",
+       "//components/policy/core/common",
+       "//components/prefs",
+--- a/chrome/browser/ui/biba/biba_spaces_controller.cc
++++ b/chrome/browser/ui/biba/biba_spaces_controller.cc
+@@ -29,6 +29,8 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+ #include "components/tabs/public/tab_group_tab_collection.h"
++#include "components/favicon/content/content_favicon_driver.h"
++#include "components/tabs/public/split_tab_collection.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "url/gurl.h"
+ 
+@@ -92,6 +94,43 @@
+   }
+ }
+ 
++std::vector<BibaSpacesController::PreviewItem> BibaSpacesController::GetPreview(
++    int index) const {
++  std::vector<PreviewItem> preview;
++  if (index < 0 || index >= kMaxSpaces || index == active_space_) {
++    return preview;
++  }
++  auto add = [&preview](const tabs::TabInterface* tab) {
++    content::WebContents* contents = tab ? tab->GetContents() : nullptr;
++    if (!contents) {
++      return;
++    }
++    PreviewItem item;
++    item.title = contents->GetTitle();
++    if (auto* driver =
++            favicon::ContentFaviconDriver::FromWebContents(contents)) {
++      item.favicon = driver->GetFavicon();
++    }
++    preview.push_back(std::move(item));
++  };
++  for (const DetachedItem& item : spaces_[index].items) {
++    if (const auto* tab = std::get_if<std::unique_ptr<DetachedTab>>(&item)) {
++      add((*tab)->tab.get());
++    } else if (const auto* collection =
++                   std::get_if<std::unique_ptr<DetachedTabCollection>>(
++                       &item)) {
++      std::visit(
++          [&add](const auto& c) {
++            for (const tabs::TabInterface* t : c->GetTabsRecursive()) {
++              add(t);
++            }
++          },
++          (*collection)->collection_);
++    }
++  }
++  return preview;
++}
++
+ tabs::TabInterface* BibaSpacesController::AttachSpace(Space& space) {
+   TabStripModel* model = tab_strip_model_.get();
+   tabs::TabInterface* first_attached = nullptr;
+--- a/chrome/browser/ui/biba/biba_spaces_controller.h
++++ b/chrome/browser/ui/biba/biba_spaces_controller.h
+@@ -10,7 +10,10 @@
+ #include <variant>
+ #include <vector>
+ 
++#include <string>
++
+ #include "base/memory/raw_ptr.h"
++#include "ui/gfx/image/image.h"
+ #include "base/files/file_path.h"
+ #include "base/functional/callback.h"
+ #include "base/memory/weak_ptr.h"
+@@ -43,6 +46,14 @@
+ 
+   int active_space() const { return active_space_; }
+ 
++  // Title + favicon of one tab, for drawing a parked Space without attaching
++  // it (swipe preview).
++  struct PreviewItem {
++    std::u16string title;
++    gfx::Image favicon;
++  };
++  std::vector<PreviewItem> GetPreview(int index) const;
++
+   // True for the visible Space and for Spaces that hold parked tabs.
+   bool IsSpaceInUse(int index) const {
+     return index == active_space_ ||
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -500,6 +500,17 @@
+   return biba_space_changed_callbacks_.Add(std::move(callback));
+ }
+ 
++std::vector<std::pair<std::u16string, gfx::Image>>
++BrowserCommandController::biba_space_preview(int index) const {
++  std::vector<std::pair<std::u16string, gfx::Image>> result;
++  if (biba_spaces_) {
++    for (auto& item : biba_spaces_->GetPreview(index)) {
++      result.emplace_back(std::move(item.title), std::move(item.favicon));
++    }
++  }
++  return result;
++}
++
+ bool BrowserCommandController::biba_space_in_use(int index) const {
+   return biba_spaces_ ? biba_spaces_->IsSpaceInUse(index) : index == 0;
+ }
+--- a/chrome/browser/ui/browser_command_controller.h
++++ b/chrome/browser/ui/browser_command_controller.h
+@@ -8,6 +8,7 @@
+ #include <memory>
+ 
+ #include "base/callback_list.h"
++#include "ui/gfx/image/image.h"
+ #include <optional>
+ 
+ #include "base/containers/flat_map.h"
+@@ -130,6 +131,9 @@
+   int biba_active_space() const;
+   // Biba: whether Space `index` exists (visible or holding parked tabs).
+   bool biba_space_in_use(int index) const;
++  // Biba: titles + favicons of a parked Space (empty for the visible one).
++  std::vector<std::pair<std::u16string, gfx::Image>> biba_space_preview(
++      int index) const;
+   // Biba: notified after the visible Space changed, with (from, to) indices.
+   using BibaSpaceChangedCallback = base::RepeatingCallback<void(int, int)>;
+   base::CallbackListSubscription BibaAddSpaceChangedCallback(
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -53,6 +53,7 @@
+ #include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h"
+ #include "chrome/browser/ui/views/tabs/organizer/organizer_panel_utils.h"
+ #include "chrome/browser/ui/views/tabs/shared/drop_arrow.h"
++#include "chrome/browser/ui/views/tabs/vertical/biba_space_preview_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.h"
+ #include "chrome/browser/ui/views/tabs/vertical/biba_space_switcher_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h"
+@@ -169,16 +170,25 @@
+       gfx::Insets::TLBR(4, region_horizontal_padding, 6,
+                         region_horizontal_padding));
+ 
++  // Biba: preview of the neighbouring Space, drawn while swiping. Not part of
++  // the flex layout; the swipe handler sizes and moves it.
++  auto* space_preview = content_area_view_->AddChildView(
++      std::make_unique<BibaSpacePreviewView>());
++  space_preview->SetProperty(views::kViewIgnoredByLayoutKey, true);
++  space_preview->SetVisible(false);
++
+   // Biba: swipe between Spaces. Everything in the content column moves except
+   // the Space dots and the empty bottom placeholder.
++  // Swiped content must not spill onto the content card.
++  content_area_view_->layer()->SetMasksToBounds(true);
+   biba_swipe_handler_ = std::make_unique<BibaSpaceSwipeHandler>(
+-      browser_view->browser(), this,
++      browser_view->browser(), content_area_view_,
+       base::BindRepeating(
+           [](views::View* content, const views::View* fixed_a,
+-             const views::View* fixed_b) {
++             const views::View* fixed_b, const views::View* fixed_c) {
+             std::vector<views::View*> movable;
+             for (views::View* child : content->children()) {
+-              if (child != fixed_a && child != fixed_b) {
++              if (child != fixed_a && child != fixed_b && child != fixed_c) {
+                 movable.push_back(child);
+               }
+             }
+@@ -186,7 +196,9 @@
+           },
+           base::Unretained(content_area_view_.get()),
+           base::Unretained(space_switcher),
+-          base::Unretained(gemini_button_.get())));
++          base::Unretained(gemini_button_.get()),
++          base::Unretained(space_preview)),
++      space_preview);
+   AddPreTargetHandler(biba_swipe_handler_.get());
+ 
+   // Views that go into the content area above
+--- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
+@@ -7,6 +7,7 @@
+ 
+ source_set("vertical") {
+   sources = [
++    "biba_space_preview_view.h",
+     "biba_space_swipe_handler.h",
+     "biba_space_switcher_view.h",
+     "top_container_button.h",
+@@ -39,6 +40,7 @@
+ 
+ source_set("impl") {
+   sources = [
++    "biba_space_preview_view.cc",
+     "biba_space_swipe_handler.cc",
+     "biba_space_switcher_view.cc",
+     "top_container_button.cc",
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_preview_view.cc
+@@ -0,0 +1,67 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/vertical/biba_space_preview_view.h"
++
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/color/color_id.h"
++#include "ui/color/color_provider.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/font_list.h"
++#include "ui/gfx/image/image_skia.h"
++#include "ui/gfx/text_constants.h"
++
++namespace {
++
++// Mirrors TabViewVerticalLayout: 16px favicon at a 7px inset, title 4px after.
++constexpr int kIconSize = 16;
++constexpr int kIconInset = 7;
++constexpr int kTitleGap = 8;
++constexpr int kRightInset = 8;
++
++}  // namespace
++
++BibaSpacePreviewView::BibaSpacePreviewView() {
++  SetCanProcessEventsWithinSubtree(false);
++}
++
++BibaSpacePreviewView::~BibaSpacePreviewView() = default;
++
++void BibaSpacePreviewView::SetItems(Items items,
++                                    int first_row_y,
++                                    int row_x,
++                                    int row_pitch,
++                                    int row_height) {
++  items_ = std::move(items);
++  first_row_y_ = first_row_y;
++  row_x_ = row_x;
++  row_pitch_ = row_pitch;
++  row_height_ = row_height;
++  SchedulePaint();
++}
++
++void BibaSpacePreviewView::OnPaint(gfx::Canvas* canvas) {
++  const SkColor text_color =
++      GetColorProvider()->GetColor(ui::kColorSysOnSurface);
++  const gfx::FontList font_list;
++  int y = first_row_y_;
++  for (const auto& [title, favicon] : items_) {
++    const int icon_x = row_x_ + kIconInset;
++    const int icon_y = y + (row_height_ - kIconSize) / 2;
++    if (!favicon.IsEmpty()) {
++      canvas->DrawImageInt(*favicon.ToImageSkia(), 0, 0,
++                           favicon.Width(), favicon.Height(), icon_x, icon_y,
++                           kIconSize, kIconSize, /*filter=*/true);
++    }
++    const int text_x = icon_x + kIconSize + kTitleGap;
++    canvas->DrawStringRectWithFlags(
++        title, font_list, text_color,
++        gfx::Rect(text_x, y, width() - text_x - kRightInset, row_height_),
++        gfx::Canvas::NO_SUBPIXEL_RENDERING);
++    y += row_pitch_;
++  }
++}
++
++BEGIN_METADATA(BibaSpacePreviewView)
++END_METADATA
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_preview_view.h
+@@ -0,0 +1,46 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_BIBA_SPACE_PREVIEW_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_BIBA_SPACE_PREVIEW_VIEW_H_
++
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/gfx/image/image.h"
++#include "ui/views/view.h"
++
++// Lightweight drawing of a parked Space's tab list (favicon + title rows),
++// shown next to the real list while the user swipes, so the neighbouring
++// Space slides in alongside instead of an empty gap. Rows mirror the vertical
++// tab metrics so the hand-off to the real list on release is seamless.
++class BibaSpacePreviewView : public views::View {
++  METADATA_HEADER(BibaSpacePreviewView, views::View)
++
++ public:
++  using Items = std::vector<std::pair<std::u16string, gfx::Image>>;
++
++  BibaSpacePreviewView();
++  BibaSpacePreviewView(const BibaSpacePreviewView&) = delete;
++  BibaSpacePreviewView& operator=(const BibaSpacePreviewView&) = delete;
++  ~BibaSpacePreviewView() override;
++
++  void SetItems(Items items, int first_row_y, int row_x, int row_pitch,
++                int row_height);
++
++  // views::View:
++  void OnPaint(gfx::Canvas* canvas) override;
++
++ private:
++  Items items_;
++  // Geometry copied from the real tab list so rows line up.
++  int first_row_y_ = 0;
++  int row_x_ = 0;
++  int row_pitch_ = 0;
++  int row_height_ = 0;
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_BIBA_SPACE_PREVIEW_VIEW_H_
+--- a/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.cc
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.cc
+@@ -6,15 +6,19 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <string_view>
+ 
+ #include "base/functional/bind.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/ui/browser_command_controller.h"
++#include "chrome/browser/ui/views/tabs/vertical/biba_space_preview_view.h"
+ #include "ui/compositor/layer.h"
+ #include "ui/compositor/layer_animator.h"
+ #include "ui/events/event.h"
+ #include "ui/gfx/animation/animation.h"
+ #include "ui/gfx/animation/tween.h"
++#include "ui/gfx/geometry/rect_conversions.h"
++#include "ui/gfx/geometry/rect_f.h"
+ #include "ui/gfx/geometry/transform.h"
+ #include "ui/views/animation/animation_builder.h"
+ #include "ui/views/view.h"
+@@ -54,10 +58,12 @@
+ 
+ BibaSpaceSwipeHandler::BibaSpaceSwipeHandler(BrowserWindowInterface* browser,
+                                              views::View* sidebar,
+-                                             MovableViewsGetter movable_views)
++                                             MovableViewsGetter movable_views,
++                                             BibaSpacePreviewView* preview)
+     : browser_(browser),
+       sidebar_(sidebar),
+-      movable_views_(std::move(movable_views)) {
++      movable_views_(std::move(movable_views)),
++      preview_(preview) {
+   if (auto* commands = chrome::BrowserCommandController::From(browser_)) {
+     space_changed_subscription_ = commands->BibaAddSpaceChangedCallback(
+         base::BindRepeating(&BibaSpaceSwipeHandler::OnSpaceChanged,
+@@ -112,6 +118,61 @@
+   }
+ }
+ 
++void BibaSpaceSwipeHandler::ShowPreview(int space, float offset,
++                                        float opacity) {
++  if (!preview_) {
++    return;
++  }
++  if (space != preview_space_) {
++    preview_space_ = space;
++    // Copy the real rows' geometry so the preview lines up with them.
++    std::vector<gfx::Rect> rows;
++    std::vector<views::View*> pending = movable_views_.Run();
++    while (!pending.empty()) {
++      views::View* view = pending.back();
++      pending.pop_back();
++      if (std::string_view(view->GetClassName()) == "TabView") {
++        gfx::RectF r(view->GetLocalBounds());
++        views::View::ConvertRectToTarget(view, sidebar_, &r);
++        rows.push_back(gfx::ToEnclosingRect(r));
++        continue;
++      }
++      for (views::View* child : view->children()) {
++        pending.push_back(child);
++      }
++    }
++    std::sort(rows.begin(), rows.end(),
++              [](const gfx::Rect& a, const gfx::Rect& b) { return a.y() < b.y(); });
++    const gfx::Rect first = rows.empty() ? gfx::Rect(8, 48, 0, 36) : rows[0];
++    const int pitch =
++        rows.size() > 1 ? rows[1].y() - rows[0].y() : first.height() + 4;
++    std::vector<std::pair<std::u16string, gfx::Image>> items;
++    if (auto* commands = chrome::BrowserCommandController::From(browser_)) {
++      items = commands->biba_space_preview(space);
++    }
++    preview_->SetBoundsRect(sidebar_->GetLocalBounds());
++    preview_->SetItems(std::move(items), first.y(), first.x(), pitch,
++                       first.height());
++  }
++  if (!preview_->layer()) {
++    preview_->SetPaintToLayer();
++    preview_->layer()->SetFillsBoundsOpaquely(false);
++  }
++  preview_->SetVisible(true);
++  preview_->layer()->GetAnimator()->StopAnimating();
++  gfx::Transform transform;
++  transform.Translate(offset, 0);
++  preview_->layer()->SetTransform(transform);
++  preview_->layer()->SetOpacity(opacity);
++}
++
++void BibaSpaceSwipeHandler::HidePreview() {
++  if (preview_) {
++    preview_->SetVisible(false);
++  }
++  preview_space_ = -1;
++}
++
+ void BibaSpaceSwipeHandler::BeginTracking() {
+   tracking_ = true;
+   accumulated_x_ = 0.0f;
+@@ -163,12 +224,20 @@
+ 
+   // Rubber-band when nothing lives in that direction (content follows the
+   // fingers: moving left reveals the next Space on the right).
+-  const bool has_neighbour = NeighbourSpace(accumulated_x_ < 0 ? +1 : -1) >= 0;
++  const int direction = accumulated_x_ < 0 ? +1 : -1;
++  const int neighbour = NeighbourSpace(direction);
+   const float offset =
+-      has_neighbour ? accumulated_x_ : accumulated_x_ * kRubberBand;
++      neighbour >= 0 ? accumulated_x_ : accumulated_x_ * kRubberBand;
+   const float width = std::max(1, sidebar_->width());
+   const float progress = std::min(1.0f, std::fabs(offset) / width);
+   SetOffset(offset, 1.0f - (1.0f - kMinOpacity) * progress);
++  // The neighbouring Space slides in right next to the outgoing list.
++  if (neighbour >= 0) {
++    ShowPreview(neighbour, offset + direction * width,
++                kMinOpacity + (1.0f - kMinOpacity) * progress);
++  } else {
++    HidePreview();
++  }
+ }
+ 
+ void BibaSpaceSwipeHandler::FinishTracking() {
+@@ -192,12 +261,28 @@
+   if (offset_ != 0.0f) {
+     AnimateToRest(kSpringBackDuration);
+   }
++  // Cancelled: the preview slides back out, then hides.
++  if (preview_ && preview_->GetVisible() && preview_->layer()) {
++    gfx::Transform out;
++    out.Translate(direction * width, 0);
++    views::AnimationBuilder()
++        .SetPreemptionStrategy(
++            ui::LayerAnimator::IMMEDIATELY_ANIMATE_TO_NEW_TARGET)
++        .OnEnded(base::BindOnce(&BibaSpaceSwipeHandler::HidePreview,
++                                base::Unretained(this)))
++        .Once()
++        .SetDuration(kSpringBackDuration)
++        .SetTransform(preview_->layer(), out, gfx::Tween::ACCEL_20_DECEL_100)
++        .SetOpacity(preview_->layer(), kMinOpacity, gfx::Tween::EASE_OUT);
++  }
+ }
+ 
+ void BibaSpaceSwipeHandler::OnSpaceChanged(int from, int to) {
+   if (from == to) {
+     return;
+   }
++  // The real list takes over from the preview at the same position.
++  HidePreview();
+   const float width = std::max(1, sidebar_->width());
+   if (gfx::Animation::PrefersReducedMotion()) {
+     // Reduced motion: a plain cross-fade, no movement.
+--- a/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.h
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.h
+@@ -13,6 +13,7 @@
+ #include "base/time/time.h"
+ #include "ui/events/event_handler.h"
+ 
++class BibaSpacePreviewView;
+ class BrowserWindowInterface;
+ 
+ namespace views {
+@@ -36,7 +37,8 @@
+ 
+   BibaSpaceSwipeHandler(BrowserWindowInterface* browser,
+                         views::View* sidebar,
+-                        MovableViewsGetter movable_views);
++                        MovableViewsGetter movable_views,
++                        BibaSpacePreviewView* preview);
+   BibaSpaceSwipeHandler(const BibaSpaceSwipeHandler&) = delete;
+   BibaSpaceSwipeHandler& operator=(const BibaSpaceSwipeHandler&) = delete;
+   ~BibaSpaceSwipeHandler() override;
+@@ -54,10 +56,16 @@
+   void SetOffset(float offset, float opacity);
+   // Animates the movable views from their current offset to rest.
+   void AnimateToRest(base::TimeDelta duration);
++  // Shows Space `space` as a preview at `offset` (loads it if needed).
++  void ShowPreview(int space, float offset, float opacity);
++  void HidePreview();
+ 
+   raw_ptr<BrowserWindowInterface> browser_;
+   raw_ptr<views::View> sidebar_;
+   MovableViewsGetter movable_views_;
++  raw_ptr<BibaSpacePreviewView> preview_;
++  // Space currently loaded into `preview_`, or -1.
++  int preview_space_ = -1;
+   base::CallbackListSubscription space_changed_subscription_;
+ 
+   bool tracking_ = false;

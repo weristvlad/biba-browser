@@ -1,0 +1,309 @@
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -231,6 +231,8 @@
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[biba::prefs::kMonochromeExtensionIcons] =
+       settings_api::PrefType::kBoolean;
++  (*s_allowlist)[biba::prefs::kSidebarShortcutHides] =
++      settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kHeliumZenMode] = settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kHeliumZenModeSidebarPinned] =
+       settings_api::PrefType::kBoolean;
+--- a/chrome/browser/resources/settings/appearance_page/appearance_layout_page.html.ts
++++ b/chrome/browser/resources/settings/appearance_page/appearance_layout_page.html.ts
+@@ -63,6 +63,11 @@
+       sub-label="Show pinned extensions in grey, like the rest of the toolbar">
+   </settings-toggle-button>
+   <settings-toggle-button class="hr"
++      pref-key="biba.appearance.sidebar_shortcut_hides"
++      label="⌘S hides the sidebar completely"
++      sub-label="Off: ⌘S collapses the sidebar to a column of icons">
++  </settings-toggle-button>
++  <settings-toggle-button class="hr"
+       pref-key="helium.browser.zen_mode"
+       label="$i18n{browserZenMode}"
+       sub-label="$i18n{browserZenModeDescription}">
+--- a/chrome/browser/ui/biba/biba_prefs.h
++++ b/chrome/browser/ui/biba/biba_prefs.h
+@@ -12,6 +12,18 @@
+ inline constexpr char kMonochromeExtensionIcons[] =
+     "biba.appearance.monochrome_extension_icons";
+ 
++// Boolean: Cmd+S hides the sidebar completely (it slides back in when the
++// pointer reaches the window's leading edge), like Dia. When false, Cmd+S
++// collapses the sidebar to a column of icons.
++inline constexpr char kSidebarShortcutHides[] =
++    "biba.appearance.sidebar_shortcut_hides";
++
++// Boolean: the sidebar is hidden (Cmd+S); the page card spans the window.
++inline constexpr char kSidebarHidden[] = "biba.sidebar_hidden";
++
++// Room the toolbar leaves for the traffic lights when the sidebar is hidden.
++inline constexpr int kTrafficLightsWidth = 72;
++
+ }  // namespace biba::prefs
+ 
+ #endif  // CHROME_BROWSER_UI_BIBA_BIBA_PREFS_H_
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/browser_command_controller.h"
+ 
++#include "chrome/browser/ui/biba/biba_prefs.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+ #include "chrome/browser/ui/biba/biba_spaces_controller.h"
+ #include "ui/base/base_window.h"
+ #include "ui/views/widget/widget.h"
+@@ -1647,9 +1649,26 @@
+       break;
+     }
+     case IDC_CTRL_S_SHORTCUT: {
++      PrefService* prefs = profile()->GetPrefs();
++      // Biba (Dia): Cmd+S hides the sidebar completely, using Helium's zen
++      // layout with the toolbar kept in place (the sidebar slides back in
++      // at the leading edge). The setting can make it collapse instead.
++      if (ShouldToggleVerticalCollapse(prefs) &&
++          prefs->GetBoolean(biba::prefs::kSidebarShortcutHides)) {
++        prefs->SetBoolean(prefs::kHeliumZenMode, false);
++        prefs->SetBoolean(biba::prefs::kSidebarHidden,
++                          !prefs->GetBoolean(biba::prefs::kSidebarHidden));
++        if (auto* browser_view =
++                BrowserView::GetBrowserViewForBrowser(browser_)) {
++          browser_view->InvalidateLayout();
++          if (browser_view->toolbar()) {
++            browser_view->toolbar()->InvalidateLayout();
++          }
++        }
++        break;
++      }
+       // In zen mode with VTS, Ctrl+S toggles the side chrome visibility
+       // instead of collapsing the tab strip.
+-      PrefService* prefs = profile()->GetPrefs();
+       auto* browser_view = BrowserView::GetBrowserViewForBrowser(browser_);
+       if (browser_view && browser_view->IsZenModeEnabledForLayout() &&
+           browser_view->ShouldDrawVerticalTabStrip() &&
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -144,6 +144,8 @@
+ 
+   registry->RegisterBooleanPref(prefs::kHeliumShowProgressBar, true);
+   registry->RegisterBooleanPref(biba::prefs::kMonochromeExtensionIcons, true);
++  registry->RegisterBooleanPref(biba::prefs::kSidebarShortcutHides, true);
++  registry->RegisterBooleanPref(biba::prefs::kSidebarHidden, false);
+ 
+   registry->RegisterBooleanPref(prefs::kHomePageIsNewTabPage, true,
+                                 pref_registration_flags);
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -5616,6 +5616,11 @@
+   const gfx::Size size = biba_space_button_->GetPreferredSize();
+   const int x = base::ClampRound(params.visual_client_area.x() +
+                                  exclusion.width()) + 2;
++  // Collapsed to icons: no room for the Space name next to the lights.
++  if (x + size.width() > vertical_tab_strip_region_view_->bounds().right()) {
++    biba_space_button_->SetVisible(false);
++    return;
++  }
+   // Centred on the traffic lights, which macOS centres in the titlebar
+   // (toolbar + 2 * card inset tall, see BrowserNativeWidgetMac).
+   const int y =
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
+@@ -72,7 +72,8 @@
+   // TODO(crbug.com/465832180): Replace constant based width final max width for
+   // view.
+   static constexpr int kUncollapsedMaxWidth = 400;
+-  static constexpr int kCollapsedWidth = 42;
++  // Biba: wide enough for the traffic lights above the icon column.
++  static constexpr int kCollapsedWidth = 76;
+   // TODO(crbug.com/465833741): Determine snapping behavior.
+   static constexpr int kCollapseSnapWidth =
+       (kUncollapsedMinWidth + kCollapsedWidth) / 2;
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -42,6 +42,9 @@
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_background_blur_backdrop.h"
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
++#include "components/prefs/pref_service.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/biba/biba_prefs.h"
+ #include "chrome/browser/ui/views/helium/frame_corner_radius.h"
+ #include "chrome/browser/ui/views/infobars/infobar_container_view.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel.h"
+@@ -961,8 +964,26 @@
+   const VerticalTabStripAnimation& vertical_tab_strip_animation =
+       layout_data_->vertical_tab_strip_animation;
+   gfx::Rect vertical_tab_strip_bounds;
+-  if (IsParentedTo(views().vertical_tab_strip_region_view,
++  // Biba (Dia): Cmd+S hides the sidebar; the page card then keeps the same
++  // inset from the window edge on all sides.
++  const bool biba_sidebar_hidden =
++      layout_data_->tab_strip_type == TabStripType::kVertical &&
++      !zen.enabled &&
++      views::AsViewClass<BrowserView>(views().browser_view.get()) &&
++      views::AsViewClass<BrowserView>(views().browser_view.get())
++          ->browser()
++          ->GetProfile()
++          ->GetPrefs()
++          ->GetBoolean(biba::prefs::kSidebarHidden);
++  if (biba_sidebar_hidden &&
++      IsParentedTo(views().vertical_tab_strip_region_view,
+                    views().browser_view)) {
++    layout.AddChild(views().vertical_tab_strip_region_view, gfx::Rect(),
++                    /*visible=*/false);
++    params.InsetHorizontal(MultiContentsView::kSplitViewContentInset,
++                           /*leading=*/!vertical_right_aligned);
++  } else if (IsParentedTo(views().vertical_tab_strip_region_view,
++                          views().browser_view)) {
+     if (layout_data_->tab_strip_type == TabStripType::kVertical) {
+       const int vertical_tab_strip_hover_width =
+           std::max(0,
+@@ -1319,8 +1340,11 @@
+           gfx::Insets::TLBR(MultiContentsView::kSplitViewContentInset, 0, 0,
+                             MultiContentsView::kSplitViewContentInset));
+     }
++    // Biba: with the sidebar hidden the toolbar spans the card and makes room
++    // for the traffic lights itself (ToolbarView), like Dia.
+     const gfx::Rect top_container_local_bounds = CalculateTopContainerLayout(
+-        top_container_layout, top_container_area, needs_exclusion);
++        top_container_layout, top_container_area,
++        needs_exclusion && !biba_sidebar_hidden);
+     top_container_layout.bounds =
+         GetTopContainerBoundsInParent(top_container_local_bounds, params);
+     if (layout_data_->tab_strip_type == TabStripType::kVertical) {
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -4,6 +4,16 @@
+ 
+ #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+ 
++#include "chrome/browser/ui/biba/biba_prefs.h"
++#include "ui/gfx/animation/tween.h"
++#include "ui/gfx/animation/animation_delegate.h"
++#include "ui/gfx/animation/slide_animation.h"
++#include "chrome/browser/ui/views/frame/browser_frame_view.h"
++#include "ui/views/window/non_client_view.h"
++#include "ui/base/class_property.h"
++#include "ui/events/event_observer.h"
++#include "ui/views/event_monitor.h"
++
+ #include <algorithm>
+ #include <memory>
+ #include <utility>
+@@ -378,6 +388,96 @@
+ 
+ DEFINE_CLASS_ELEMENT_IDENTIFIER_VALUE(ToolbarView, kToolbarElementId);
+ 
++
++namespace {
++DEFINE_UI_CLASS_PROPERTY_KEY(bool, kBibaLightsShownKey, false)
++// How far the lights are revealed, 0..1000 (animated).
++DEFINE_UI_CLASS_PROPERTY_KEY(int, kBibaLightsRevealKey, 0)
++}  // namespace
++
++// Watches the pointer in the window while the sidebar is hidden and reveals
++// the traffic lights near the top-leading corner.
++class BibaLightsRevealer : public ui::EventObserver,
++                           public gfx::AnimationDelegate {
++ public:
++  explicit BibaLightsRevealer(ToolbarView* toolbar) : toolbar_(toolbar) {
++    // Close to Dia's "firm" spring (0.25 s, damping 0.9).
++    reveal_.SetSlideDuration(base::Milliseconds(250));
++    reveal_.SetTweenType(gfx::Tween::EASE_OUT);
++    monitor_ = views::EventMonitor::CreateWindowMonitor(
++        this, toolbar->GetWidget()->GetNativeWindow(),
++        {ui::EventType::kMouseMoved, ui::EventType::kMouseExited,
++         ui::EventType::kMouseEntered});
++  }
++
++  void OnEvent(const ui::Event& event) override {
++    bool near = false;
++    if (event.type() != ui::EventType::kMouseExited && event.IsLocatedEvent()) {
++      gfx::Point point = event.AsLocatedEvent()->root_location();
++      views::View::ConvertPointFromWidget(toolbar_, &point);
++      const bool shown = toolbar_->GetProperty(kBibaLightsShownKey);
++      const int reach = shown ? biba::prefs::kTrafficLightsWidth + 24 : 56;
++      near = point.y() < toolbar_->height() + 6 && point.x() < reach;
++    }
++    if (near != toolbar_->GetProperty(kBibaLightsShownKey)) {
++      toolbar_->SetProperty(kBibaLightsShownKey, near);
++      if (near) {
++        reveal_.Show();
++      } else {
++        reveal_.Hide();
++      }
++    }
++  }
++
++  void AnimationProgressed(const gfx::Animation* animation) override {
++    toolbar_->SetProperty(
++        kBibaLightsRevealKey,
++        static_cast<int>(animation->GetCurrentValue() * 1000));
++    toolbar_->InvalidateLayout();
++  }
++
++ private:
++  raw_ptr<ToolbarView> toolbar_;
++  gfx::SlideAnimation reveal_{this};
++  std::unique_ptr<views::EventMonitor> monitor_;
++};
++
++DEFINE_UI_CLASS_PROPERTY_TYPE(BibaLightsRevealer*)
++
++namespace {
++
++DEFINE_OWNED_UI_CLASS_PROPERTY_KEY(BibaLightsRevealer, kBibaLightsRevealerKey)
++
++void BibaUpdateTrafficLights(ToolbarView* toolbar) {
++  BrowserWindowInterface* browser = toolbar->browser();
++  views::Widget* widget = toolbar->GetWidget();
++  if (!browser || !widget) {
++    return;
++  }
++  const bool hidden_sidebar =
++      browser->GetProfile()->GetPrefs()->GetBoolean(
++          biba::prefs::kSidebarHidden) &&
++      !widget->IsFullscreen();
++  if (hidden_sidebar && !toolbar->GetProperty(kBibaLightsRevealerKey)) {
++    toolbar->SetProperty(kBibaLightsRevealerKey,
++                         std::make_unique<BibaLightsRevealer>(toolbar));
++  } else if (!hidden_sidebar && toolbar->GetProperty(kBibaLightsRevealerKey)) {
++    toolbar->ClearProperty(kBibaLightsRevealerKey);
++    toolbar->SetProperty(kBibaLightsShownKey, false);
++    toolbar->SetProperty(kBibaLightsRevealKey, 0);
++  }
++  const float reveal =
++      hidden_sidebar ? toolbar->GetProperty(kBibaLightsRevealKey) / 1000.0f
++                     : 1.0f;
++  if (auto* frame_view = static_cast<BrowserFrameView*>(
++          widget->non_client_view() ? widget->non_client_view()->frame_view()
++                                    : nullptr)) {
++    frame_view->SetCaptionButtonsOpacity(reveal);
++  }
++}
++
++}  // namespace
++
+ ToolbarView::ToolbarView(BrowserWindowInterface* browser,
+                          BrowserView* browser_view)
+     : AnimationDelegateViews(this),
+@@ -2007,6 +2107,17 @@
+ 
+   gfx::Insets interior_margin =
+       GetLayoutInsets(LayoutInset::TOOLBAR_INTERIOR_MARGIN);
++  // Biba (Dia): with the sidebar hidden the traffic lights are hidden too;
++  // they appear when the pointer reaches the top-leading corner, and the
++  // toolbar buttons move aside for them.
++  BibaUpdateTrafficLights(this);
++  if (browser_->GetProfile()->GetPrefs()->GetBoolean(
++          biba::prefs::kSidebarHidden)) {
++    interior_margin.set_left(
++        interior_margin.left() +
++        biba::prefs::kTrafficLightsWidth * GetProperty(kBibaLightsRevealKey) /
++            1000);
++  }
+ 
+   const bool is_trailing_contextual_tasks_visible =
+       IsTrailingContextualTasksButtonVisible();

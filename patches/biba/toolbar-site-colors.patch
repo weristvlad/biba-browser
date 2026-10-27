@@ -1,0 +1,344 @@
+--- a/chrome/browser/ui/views/frame/biba_frame_paint.cc
++++ b/chrome/browser/ui/views/frame/biba_frame_paint.cc
+@@ -240,12 +240,8 @@
+   if (!site || SkColorGetA(*site) != SK_AlphaOPAQUE) {
+     return std::nullopt;
+   }
+-  // Toolbar text and icons follow the browser theme, so only take colours on
+-  // the theme's side (dark page in dark mode, light page in light mode).
+-  const SkColor toolbar = view->GetColorProvider()->GetColor(kColorToolbar);
+-  if (color_utils::IsDark(*site) != color_utils::IsDark(toolbar)) {
+-    return std::nullopt;
+-  }
++  // The toolbar's icons and text switch to dark/light colours to match
++  // (LocationBarView gives the toolbar a matching ColorProvider).
+   return site;
+ }
+ 
+--- a/chrome/browser/ui/views/location_bar/location_bar_view.cc
++++ b/chrome/browser/ui/views/location_bar/location_bar_view.cc
+@@ -3,6 +3,10 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/ui/views/location_bar/location_bar_view.h"
++#include "ui/gfx/color_utils.h"
++#include "ui/color/color_provider_key.h"
++#include "ui/color/color_provider_manager.h"
++#include "ui/views/biba_color_override.h"
+ #include "chrome/common/pref_names.h"
+ #include "content/public/common/url_constants.h"
+ #include "base/strings/utf_string_conversions.h"
+@@ -197,6 +201,45 @@
+ 
+ namespace {
+ 
++// Biba (Dia): the toolbar takes the page's colour; over a page darker or
++// lighter than the window theme, the toolbar's icons and text switch to the
++// matching dark/light colours, the rest of the window keeps its own.
++void BibaMatchToolbarToPage(LocationBarView* location_bar) {
++  views::View* toolbar = location_bar->parent();
++  while (toolbar &&
++         std::string_view(toolbar->GetClassName()) != "ToolbarView") {
++    toolbar = toolbar->parent();
++  }
++  views::Widget* widget = location_bar->GetWidget();
++  if (!toolbar || !widget || !widget->GetColorProvider()) {
++    return;
++  }
++  const ui::ColorProvider* override = nullptr;
++  content::WebContents* contents = location_bar->GetWebContents();
++  std::optional<SkColor> site =
++      contents ? contents->GetThemeColor() : std::nullopt;
++  if (!site && contents) {
++    site = contents->GetBackgroundColor();
++  }
++  if (site && SkColorGetA(*site) == SK_AlphaOPAQUE) {
++    const bool window_dark = color_utils::IsDark(
++        widget->GetColorProvider()->GetColor(kColorToolbar));
++    const bool page_dark = color_utils::IsDark(*site);
++    if (page_dark != window_dark) {
++      ui::ColorProviderKey key = widget->GetColorProviderKeyForTesting();
++      key.color_mode = page_dark ? ui::ColorProviderKey::ColorMode::kDark
++                                 : ui::ColorProviderKey::ColorMode::kLight;
++      override = ui::ColorProviderManager::Get().GetColorProviderFor(key);
++    }
++  }
++  if (override != views::GetBibaColorProviderOverride(toolbar)) {
++    views::SetBibaColorProviderOverride(toolbar, override);
++    // Buttons cache colours when the theme changes; let them re-read.
++    widget->ThemeChanged();
++  }
++  toolbar->SchedulePaint();
++}
++
+ // Biba (Dia): at rest the address is plain text, no site-info icon; it comes
+ // back on focus. Security warnings still show (they carry a label).
+ bool BibaAddressAtRest(LocationBarView* view, bool is_popup_mode) {
+@@ -1178,14 +1221,10 @@
+         active, base::BindRepeating(
+                     [](LocationBarView* self) {
+                       self->RefreshBibaTitle();
+-                      if (self->parent()) {
+-                        self->parent()->SchedulePaint();
+-                      }
++                      BibaMatchToolbarToPage(self);
+                     },
+                     base::Unretained(this)));
+-    if (parent()) {
+-      parent()->SchedulePaint();
+-    }
++    BibaMatchToolbarToPage(this);
+   } else {
+     biba_title_watcher_.reset();
+   }
+--- a/ui/views/BUILD.gn
++++ b/ui/views/BUILD.gn
+@@ -324,6 +324,7 @@
+     "style/typography_provider.h",
+     "touchui/touch_selection_controller.h",
+     "view.h",
++    "biba_color_override.h",
+     "view_class_properties.h",
+     "view_constants.h",
+     "view_model.h",
+@@ -564,6 +565,7 @@
+     "style/platform_style.cc",
+     "style/typography_provider.cc",
+     "view.cc",
++    "biba_color_override.cc",
+     "view_class_properties.cc",
+     "view_model.cc",
+     "view_model_utils.cc",
+--- /dev/null
++++ b/ui/views/biba_color_override.cc
+@@ -0,0 +1,93 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "ui/views/biba_color_override.h"
++
++#include <map>
++#include <memory>
++
++#include "base/memory/raw_ptr.h"
++#include "base/no_destructor.h"
++#include "ui/views/view.h"
++#include "ui/views/view_observer.h"
++
++namespace views {
++
++namespace {
++
++// Drops the override when its view goes away.
++class OverrideEntry : public ViewObserver {
++ public:
++  OverrideEntry(View* view, const ui::ColorProvider* provider)
++      : view_(view), provider_(provider) {
++    view_->AddObserver(this);
++  }
++  ~OverrideEntry() override {
++    if (view_) {
++      view_->RemoveObserver(this);
++    }
++  }
++
++  const ui::ColorProvider* provider() const { return provider_; }
++  void set_provider(const ui::ColorProvider* provider) { provider_ = provider; }
++
++  void OnViewIsDeleting(View* observed_view) override;
++
++ private:
++  raw_ptr<View> view_;
++  raw_ptr<const ui::ColorProvider> provider_;
++};
++
++std::map<const View*, std::unique_ptr<OverrideEntry>>& Overrides() {
++  static base::NoDestructor<std::map<const View*, std::unique_ptr<OverrideEntry>>>
++      overrides;
++  return *overrides;
++}
++
++void OverrideEntry::OnViewIsDeleting(View* observed_view) {
++  observed_view->RemoveObserver(this);
++  view_ = nullptr;
++  Overrides().erase(observed_view);  // Deletes `this`; nothing after.
++}
++
++}  // namespace
++
++void SetBibaColorProviderOverride(View* view,
++                                  const ui::ColorProvider* provider) {
++  auto& overrides = Overrides();
++  auto it = overrides.find(view);
++  if (!provider) {
++    if (it != overrides.end()) {
++      overrides.erase(it);
++    }
++    return;
++  }
++  if (it != overrides.end()) {
++    it->second->set_provider(provider);
++  } else {
++    overrides.emplace(view, std::make_unique<OverrideEntry>(view, provider));
++  }
++}
++
++const ui::ColorProvider* GetBibaColorProviderOverride(const View* view) {
++  const auto& overrides = Overrides();
++  auto it = overrides.find(view);
++  return it == overrides.end() ? nullptr : it->second->provider();
++}
++
++const ui::ColorProvider* FindBibaColorProviderOverride(const View* view) {
++  const auto& overrides = Overrides();
++  if (overrides.empty()) {
++    return nullptr;
++  }
++  for (const View* v = view; v; v = v->parent()) {
++    auto it = overrides.find(v);
++    if (it != overrides.end()) {
++      return it->second->provider();
++    }
++  }
++  return nullptr;
++}
++
++}  // namespace views
+--- /dev/null
++++ b/ui/views/biba_color_override.h
+@@ -0,0 +1,33 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef UI_VIEWS_BIBA_COLOR_OVERRIDE_H_
++#define UI_VIEWS_BIBA_COLOR_OVERRIDE_H_
++
++#include "ui/views/views_export.h"
++
++namespace ui {
++class ColorProvider;
++}
++
++namespace views {
++
++class View;
++
++// Biba: gives `view` and its descendants their own ColorProvider (e.g. the
++// toolbar switching to dark colours over a dark page while the rest of the
++// window stays light). nullptr removes the override. The override goes away
++// by itself when `view` is deleted. Callers re-run OnThemeChanged() (e.g.
++// Widget::ThemeChanged()) so views pick the new colours up.
++VIEWS_EXPORT void SetBibaColorProviderOverride(View* view,
++                                               const ui::ColorProvider* provider);
++VIEWS_EXPORT const ui::ColorProvider* GetBibaColorProviderOverride(
++    const View* view);
++
++// The override that applies to `view`: its own or its nearest ancestor's.
++const ui::ColorProvider* FindBibaColorProviderOverride(const View* view);
++
++}  // namespace views
++
++#endif  // UI_VIEWS_BIBA_COLOR_OVERRIDE_H_
+--- a/ui/views/view.cc
++++ b/ui/views/view.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "ui/views/view.h"
+ 
++#include "ui/views/biba_color_override.h"
++
+ #include <algorithm>
+ #include <cmath>
+ #include <cstddef>
+@@ -1567,6 +1569,10 @@
+ }
+ 
+ const ui::ColorProvider* View::GetColorProvider() const {
++  // Biba: a subtree may carry its own colours (ui/views/biba_color_override.h).
++  if (const ui::ColorProvider* override = FindBibaColorProviderOverride(this)) {
++    return override;
++  }
+   const auto* widget = GetWidget();
+   return widget ? widget->GetColorProvider() : nullptr;
+ }
+--- a/chrome/browser/ui/views/frame/multi_contents_view.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_view.cc
+@@ -62,7 +62,10 @@
+ 
+ bool IsTopChromeAttached(const BrowserView& browser_view,
+                          bool should_show_top_separator) {
+-  return should_show_top_separator &&
++  // Biba (Dia): with the sidebar, toolbar and page are one card even though
++  // no separator line is drawn between them.
++  return (should_show_top_separator ||
++          browser_view.ShouldDrawVerticalTabStrip()) &&
+          (!browser_view.IsZenModeEnabledForLayout() ||
+           browser_view.GetTopChromeRevealRatio() >=
+               kZenTopChromeAttachedThreshold);
+--- a/chrome/browser/ui/layout_constants.cc
++++ b/chrome/browser/ui/layout_constants.cc
+@@ -150,6 +150,7 @@
+     case LayoutConstant::kDownloadIconSize:
+       return 20;
+     case LayoutConstant::kMainBackgroundRegionCornerRadius:
++      return 10;  // Biba (Dia): the page card's corners.
+     case LayoutConstant::kToolbarCornerRadius:
+       return 8;
+     // Biba (Dia): roomier sidebar rows and app tiles.
+--- a/chrome/browser/ui/views/frame/contents_container_view.cc
++++ b/chrome/browser/ui/views/frame/contents_container_view.cc
+@@ -233,8 +233,11 @@
+             kSplitViewContentPadding + ContentsContainerOutline::kThickness)));
+       } else {
+         // Reserve the stroke inside the container's existing outer margin.
+-        SetBorder(views::CreateEmptyBorder(
+-            gfx::Insets(ContentsContainerOutline::kThickness)));
++        // Biba (Dia): no stroke with the sidebar, so no gap for it either.
++        SetBorder(browser_view_->ShouldDrawVerticalTabStrip()
++                      ? nullptr
++                      : views::CreateEmptyBorder(gfx::Insets(
++                            ContentsContainerOutline::kThickness)));
+       }
+     }
+     if (split_changed || rounded_contents_changed || corner_state_changed) {
+@@ -243,6 +246,11 @@
+ 
+     if (is_in_split) {
+       container_outline_->UpdateState(is_active, is_highlighted);
++    } else if (browser_view_->GetIsNormalType() &&
++               browser_view_->ShouldDrawVerticalTabStrip()) {
++      // Biba (Dia): toolbar and page form one card; its shape comes from the
++      // card's shadow, not a stroke around the page.
++      container_outline_->SetVisible(false);
+     } else if (browser_view_->GetIsNormalType()) {
+       container_outline_->UpdateState(false, kColorToolbarContentAreaSeparator);
+     } else {
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -1766,6 +1766,24 @@
+     background->SetPrimaryColor(CustomCornersBackground::ToolbarTheme());
+   }
+ 
++  // Biba (Dia): the toolbar is the rounded top of the page card; the frame
++  // shows behind its corners.
++  if (views().toolbar && views().toolbar->background()) {
++    if (auto* toolbar_background =
++            views().toolbar->background()->AsA<CustomCornersBackground>()) {
++      CustomCornersBackground::Corners corners;
++      if (layout_data_->tab_strip_type == TabStripType::kVertical &&
++          !is_fullscreen(layout_data_->window_state)) {
++        const CustomCornersBackground::Corner rounded{
++            CustomCornersBackground::CornerType::kRoundedWithBackground,
++            GetLayoutConstant(
++                LayoutConstant::kMainBackgroundRegionCornerRadius)};
++        corners[CornerOrientation::kTopLeading] = rounded;
++        corners[CornerOrientation::kTopTrailing] = rounded;
++      }
++      toolbar_background->SetCorners(corners);
++    }
++  }
+ }
+ 
+ void BrowserViewTabbedLayoutImpl::OnLayoutParamsChanged(

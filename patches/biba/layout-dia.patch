@@ -1,0 +1,47 @@
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -481,8 +481,11 @@
+     BrowserLayoutParams& params) const {
+   HorizontalLayout layout;
+   // Start with some preliminary values.
++  // Biba: with a vertical tab strip the toolbar lives in the content column
++  // (Dia-style card), not across the whole window.
+   layout.force_top_container_to_top =
+-      layout_data_->tab_strip_type != TabStripType::kHorizontal;
++      layout_data_->tab_strip_type != TabStripType::kHorizontal &&
++      layout_data_->tab_strip_type != TabStripType::kVertical;
+ 
+   layout.is_split_view = delegate().IsActiveTabSplit();
+ 
+@@ -1307,6 +1310,13 @@
+         params.InLocalCoordinates(params.visual_client_area), needs_exclusion);
+     top_container_layout.bounds =
+         GetTopContainerBoundsInParent(top_container_local_bounds, params);
++    if (layout_data_->tab_strip_type == TabStripType::kVertical) {
++      // Biba: the toolbar is the top of the content card, inset from the
++      // window edge like the card itself.
++      top_container_layout.bounds.Inset(
++          gfx::Insets::TLBR(MultiContentsView::kSplitViewContentInset, 0, 0,
++                            MultiContentsView::kSplitViewContentInset));
++    }
+     params.SetTop(top_container_layout.bounds.bottom());
+   }
+ 
+--- a/chrome/browser/ui/views/frame/themed_background.cc
++++ b/chrome/browser/ui/views/frame/themed_background.cc
+@@ -116,12 +116,9 @@
+                                        const views::View* view,
+                                        const BrowserView* browser_view,
+                                        ThemeChoice theme_choice) {
+-  // Biba: the toolbar row belongs to the window frame (one tinted surface with
+-  // the sidebar); only the content card keeps the toolbar colour.
+-  const bool biba_frame_surface =
+-      theme_choice == ThemeChoice::kFrameTheme ||
+-      std::string_view(view->GetClassName()) == "ToolbarView";
+-  if (biba_frame_surface &&
++  // Biba: frame surfaces carry the active Space's colour. The toolbar keeps
++  // the card colour: it is the top of the content card (Dia layout).
++  if (theme_choice == ThemeChoice::kFrameTheme &&
+       biba::PaintSpaceFrame(canvas, view, browser_view)) {
+     return;
+   }

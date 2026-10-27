@@ -1,0 +1,251 @@
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -656,6 +656,7 @@
+       "biba/biba_spaces_controller.cc",
+       "biba/biba_spaces_controller.h",
+       "biba/biba_prefs.h",
++      "biba/biba_command_bar.h",
+       "browser_command_controller.cc",
+     ]
+     public_deps = [
+--- /dev/null
++++ b/chrome/browser/ui/biba/biba_command_bar.h
+@@ -0,0 +1,19 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_BIBA_BIBA_COMMAND_BAR_H_
++#define CHROME_BROWSER_UI_BIBA_BIBA_COMMAND_BAR_H_
++
++class BrowserWindowInterface;
++
++namespace biba {
++
++// Cmd+T: a Spotlight-like box centred over the (new) active tab. Type a
++// search or an address and press Return to load it in that tab; Esc closes
++// the box. Returns false if it can't be shown.
++bool ShowCommandBar(BrowserWindowInterface* browser);
++
++}  // namespace biba
++
++#endif  // CHROME_BROWSER_UI_BIBA_BIBA_COMMAND_BAR_H_
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/browser_command_controller.h"
+ 
++#include "chrome/browser/ui/biba/biba_command_bar.h"
+ #include "chrome/browser/ui/biba/biba_prefs.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+ #include "chrome/browser/ui/biba/biba_spaces_controller.h"
+@@ -889,7 +890,12 @@
+       CloseWindow(browser_);
+       break;
+     case IDC_NEW_TAB: {
++      // Biba (Dia): Cmd+T opens a new tab with the search box over it;
++      // Return loads the result in that tab.
+       NewTab(browser_, NewTabTypes::kNewTabCommand);
++      if (browser_->GetType() == BrowserWindowInterface::TYPE_NORMAL) {
++        biba::ShowCommandBar(browser_);
++      }
+       break;
+     }
+     case IDC_NEW_TAB_TO_RIGHT: {
+--- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
+@@ -41,6 +41,7 @@
+ 
+ source_set("impl") {
+   sources = [
++    "biba_command_bar_view.cc",
+     "biba_space_menu_button.cc",
+     "biba_space_preview_view.cc",
+     "biba_space_swipe_handler.cc",
+@@ -59,6 +60,8 @@
+     "//chrome/app:command_ids",
+     "//chrome/browser/ui:browser_command_controller",
+     "//chrome/browser/ui/views/frame:biba_frame_paint",
++    "//chrome/browser/autocomplete",
++    "//components/omnibox/browser",
+     "//components/viz/common",
+     "//ui/compositor",
+     "//ui/menus",
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/vertical/biba_command_bar_view.cc
+@@ -0,0 +1,174 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include <memory>
++#include <string>
++
++#include "chrome/browser/autocomplete/autocomplete_classifier_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/biba/biba_command_bar.h"
++#include "chrome/browser/ui/navigator/browser_navigator.h"
++#include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/frame/multi_contents_view.h"
++#include "components/omnibox/browser/autocomplete_classifier.h"
++#include "components/omnibox/browser/autocomplete_match.h"
++#include "components/vector_icons/vector_icons.h"
++#include "third_party/metrics_proto/omnibox_event.pb.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/image_model.h"
++#include "ui/base/mojom/dialog_button.mojom.h"
++#include "ui/base/page_transition_types.h"
++#include "ui/base/window_open_disposition.h"
++#include "ui/color/color_id.h"
++#include "ui/events/keycodes/keyboard_codes.h"
++#include "ui/gfx/font_list.h"
++#include "ui/views/background.h"
++#include "ui/views/border.h"
++#include "ui/views/widget/widget.h"
++#include "ui/views/widget/widget_observer.h"
++#include "ui/gfx/geometry/rounded_corners_f.h"
++#include "ui/views/controls/image_view.h"
++#include "ui/views/controls/textfield/textfield.h"
++#include "ui/views/controls/textfield/textfield_controller.h"
++#include "ui/views/layout/box_layout.h"
++
++namespace {
++
++constexpr int kBarWidth = 640;
++constexpr int kCornerRadius = 16;
++
++class BibaCommandBarView : public views::View,
++                           public views::TextfieldController,
++                           public views::WidgetObserver {
++  METADATA_HEADER(BibaCommandBarView, views::View)
++
++ public:
++  explicit BibaCommandBarView(BrowserWindowInterface* browser)
++      : browser_(browser) {
++    SetBackground(views::CreateRoundedRectBackground(ui::kColorDialogBackground,
++                                                     kCornerRadius));
++    SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(14, 18)));
++    SetLayoutManager(std::make_unique<views::BoxLayout>(
++                         views::BoxLayout::Orientation::kHorizontal,
++                         gfx::Insets(), 12))
++        ->set_cross_axis_alignment(
++            views::BoxLayout::CrossAxisAlignment::kCenter);
++
++    AddChildView(std::make_unique<views::ImageView>(
++        ui::ImageModel::FromVectorIcon(vector_icons::kSearchIcon,
++                                       ui::kColorIconSecondary, 20)));
++    textfield_ = AddChildView(std::make_unique<views::Textfield>());
++    textfield_->SetPlaceholderText(u"Search or enter address");
++    textfield_->SetBorder(nullptr);
++    textfield_->SetBackground(nullptr);
++    textfield_->SetFontList(gfx::FontList().DeriveWithSizeDelta(5));
++    textfield_->set_controller(this);
++    textfield_->SetPreferredSize(gfx::Size(kBarWidth - 80, 32));
++    textfield_->GetViewAccessibility().SetName(u"Search or enter address");
++  }
++  BibaCommandBarView(const BibaCommandBarView&) = delete;
++  BibaCommandBarView& operator=(const BibaCommandBarView&) = delete;
++  ~BibaCommandBarView() override = default;
++
++  views::Textfield* textfield() { return textfield_; }
++
++  // views::TextfieldController:
++  bool HandleKeyEvent(views::Textfield* sender,
++                      const ui::KeyEvent& key_event) override {
++    if (key_event.type() != ui::EventType::kKeyPressed) {
++      return false;
++    }
++    if (key_event.key_code() == ui::VKEY_ESCAPE) {
++      GetWidget()->Close();
++      return true;
++    }
++    if (key_event.key_code() == ui::VKEY_RETURN) {
++      Open(std::u16string(sender->GetText()));
++      return true;
++    }
++    return false;
++  }
++
++  // views::WidgetObserver: clicking elsewhere closes the bar.
++  void OnWidgetActivationChanged(views::Widget* widget, bool active) override {
++    if (!active) {
++      widget->RemoveObserver(this);
++      widget->Close();
++    }
++  }
++
++ private:
++  void Open(const std::u16string& text) {
++    if (text.empty() || !browser_) {
++      return;
++    }
++    // Same rules as the address bar: addresses open, anything else is a
++    // search with the default engine. No AI.
++    AutocompleteMatch match;
++    AutocompleteClassifierFactory::GetForProfile(browser_->GetProfile())
++        ->Classify(text, /*in_keyword_mode=*/false,
++                   /*allow_exact_keyword_match=*/true,
++                   metrics::OmniboxEventProto::INVALID_SPEC, &match, nullptr);
++    if (!match.destination_url.is_valid()) {
++      return;
++    }
++    NavigateParams params(browser_.get(), match.destination_url,
++                          ui::PAGE_TRANSITION_TYPED);
++    params.disposition = WindowOpenDisposition::CURRENT_TAB;
++    GetWidget()->Close();
++    Navigate(&params);
++  }
++
++  raw_ptr<BrowserWindowInterface> browser_;
++  raw_ptr<views::Textfield> textfield_ = nullptr;
++};
++
++BEGIN_METADATA(BibaCommandBarView)
++END_METADATA
++
++}  // namespace
++
++namespace biba {
++
++bool ShowCommandBar(BrowserWindowInterface* browser) {
++  auto* browser_view = BrowserView::GetBrowserViewForBrowser(browser);
++  views::Widget* parent = browser_view ? browser_view->GetWidget() : nullptr;
++  if (!parent || !browser_view->multi_contents_view()) {
++    return false;
++  }
++  auto contents = std::make_unique<BibaCommandBarView>(browser);
++  BibaCommandBarView* bar = contents.get();
++
++  views::Widget::InitParams params(
++      views::Widget::InitParams::CLIENT_OWNS_WIDGET,
++      views::Widget::InitParams::TYPE_POPUP);
++  params.parent = parent->GetNativeView();
++  params.opacity = views::Widget::InitParams::WindowOpacity::kTranslucent;
++  params.shadow_type = views::Widget::InitParams::ShadowType::kDrop;
++  params.rounded_corners = gfx::RoundedCornersF(kCornerRadius);
++  params.activatable = views::Widget::InitParams::Activatable::kYes;
++  params.name = "BibaCommandBar";
++  const gfx::Rect page =
++      browser_view->multi_contents_view()->GetBoundsInScreen();
++  const gfx::Size size = bar->GetPreferredSize();
++  params.bounds = gfx::Rect(page.CenterPoint().x() - size.width() / 2,
++                            page.y() + page.height() / 4, size.width(),
++                            size.height());
++
++  // The widget deletes itself (and the bar) when closed.
++  auto* widget = new views::Widget();
++  params.ownership = views::Widget::InitParams::WIDGET_OWNS_NATIVE_WIDGET;
++  widget->Init(std::move(params));
++  widget->SetContentsView(std::move(contents));
++  widget->AddObserver(bar);
++  widget->Show();
++  widget->Activate();
++  bar->textfield()->RequestFocus();
++  return true;
++}
++
++}  // namespace biba

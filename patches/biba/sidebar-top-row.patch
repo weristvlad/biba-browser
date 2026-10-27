@@ -1,0 +1,153 @@
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ 
++#include "chrome/browser/ui/views/tabs/vertical/biba_space_menu_button.h"
++
+ #include <stdint.h>
+ 
+ #include <algorithm>
+@@ -1110,6 +1112,8 @@
+     }
+     vertical_tab_strip_region_view_ =
+         AddChildView(std::move(vertical_tab_strip_container));
++    biba_space_button_ =
++        AddChildView(std::make_unique<BibaSpaceMenuButton>(browser_));
+   } else {
+     horizontal_tab_strip_region_view_->InitializeTabStrip();
+   }
+@@ -5419,6 +5423,28 @@
+     }
+   }
+ 
++  // Biba: with the toolbar inside the content card, the frame band above it
++  // and the sidebar's title row (right of the traffic lights) are window
++  // title bar: drag the window from them. The Space button stays clickable.
++  if (vertical_tab_strip_region_view_ &&
++      vertical_tab_strip_region_view_->GetVisible()) {
++    const gfx::Point& p = point_in_browser_view_coords;
++    if (biba_space_button_ && biba_space_button_->GetVisible() &&
++        biba_space_button_->bounds().Contains(p)) {
++      return HTCLIENT;
++    }
++    const views::View* sidebar = vertical_tab_strip_region_view_;
++    const bool above_sidebar =
++        p.x() < sidebar->bounds().right() && p.y() < sidebar->y();
++    const bool above_toolbar = top_container_ &&
++                               top_container_->GetVisible() &&
++                               p.x() >= sidebar->bounds().right() &&
++                               p.y() < top_container_->y();
++    if (above_sidebar || above_toolbar) {
++      return HTCAPTION;
++    }
++  }
++
+   // Let the frame handle any events that fall within the bounds of the window
+   // controls overlay.
+   if (IsWindowControlsOverlayEnabled() && GetActiveWebContents()) {
+@@ -5571,6 +5597,30 @@
+ ///////////////////////////////////////////////////////////////////////////////
+ // BrowserView, views::View overrides:
+ 
++void BrowserView::LayoutBibaSpaceButton() {
++  if (!biba_space_button_) {
++    return;
++  }
++  const bool sidebar_visible =
++      vertical_tab_strip_region_view_ &&
++      vertical_tab_strip_region_view_->GetVisible() &&
++      !vertical_tab_strip_region_view_->bounds().IsEmpty();
++  biba_space_button_->SetVisible(sidebar_visible);
++  if (!sidebar_visible || !browser_widget_ || !browser_widget_->GetFrameView()) {
++    return;
++  }
++  // Just right of the traffic lights, centred on them.
++  const BrowserLayoutParams params =
++      browser_widget_->GetFrameView()->GetBrowserLayoutParams();
++  const gfx::SizeF exclusion = params.leading_exclusion.ContentWithPadding();
++  const gfx::Size size = biba_space_button_->GetPreferredSize();
++  const int x = base::ClampRound(params.visual_client_area.x() +
++                                 exclusion.width()) + 2;
++  const int y = base::ClampRound(params.visual_client_area.y() +
++                                 (exclusion.height() - size.height()) / 2.0f);
++  biba_space_button_->SetBoundsRect(gfx::Rect(gfx::Point(x, y), size));
++}
++
+ void BrowserView::Layout(PassKey) {
+   TRACE_EVENT0("ui", "BrowserView::Layout");
+   // Do not perform layout if the view is not yet initialized, shutting down,
+@@ -5711,6 +5761,7 @@
+ 
+   layout_deferred_while_invisible_ = false;
+   last_laid_out_size_ = size();
++  LayoutBibaSpaceButton();
+ }
+ 
+ void BrowserView::OnGestureEvent(ui::GestureEvent* event) {
+--- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
+@@ -7,6 +7,7 @@
+ 
+ source_set("vertical") {
+   sources = [
++    "biba_space_menu_button.h",
+     "biba_space_preview_view.h",
+     "biba_space_swipe_handler.h",
+     "biba_space_switcher_view.h",
+@@ -40,6 +41,7 @@
+ 
+ source_set("impl") {
+   sources = [
++    "biba_space_menu_button.cc",
+     "biba_space_preview_view.cc",
+     "biba_space_swipe_handler.cc",
+     "biba_space_switcher_view.cc",
+@@ -58,6 +60,7 @@
+     "//chrome/browser/ui:browser_command_controller",
+     "//chrome/browser/ui/views/frame:biba_frame_paint",
+     "//ui/compositor",
++    "//ui/menus",
+     "//ui/events",
+     "//ui/gfx",
+     "//chrome/browser:primitives",
+--- a/chrome/browser/ui/views/tabs/vertical/biba_space_menu_button.cc
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_menu_button.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/views/tabs/vertical/biba_space_menu_button.h"
+ 
+ #include "base/functional/bind.h"
++#include "cc/paint/paint_flags.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/ui/browser_command_controller.h"
+@@ -17,6 +18,8 @@
+ #include "ui/gfx/canvas.h"
+ #include "ui/gfx/image/canvas_image_source.h"
+ #include "ui/gfx/image/image_skia.h"
++#include "ui/base/mojom/menu_source_type.mojom.h"
++#include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/controls/menu/menu_runner.h"
+ 
+ namespace {
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -762,6 +762,8 @@
+ 
+   // views::View:
+   void Layout(PassKey) override;
++  // Biba: places the Space menu button right of the traffic lights.
++  void LayoutBibaSpaceButton();
+   void OnGestureEvent(ui::GestureEvent* event) override;
+   void ViewHierarchyChanged(
+       const views::ViewHierarchyChangedDetails& details) override;
+@@ -1310,6 +1312,8 @@
+ 
+   // The view responsible for housing the contents of the vertical tab strip.
+   raw_ptr<VerticalTabStripRegionView> vertical_tab_strip_region_view_ = nullptr;
++  // Biba: Space menu button in the title bar, next to the traffic lights.
++  raw_ptr<views::View> biba_space_button_ = nullptr;
+   raw_ptr<VerticalTabStripBackgroundBlurBackdrop>
+       vertical_tab_strip_background_blur_backdrop_ = nullptr;
+ 

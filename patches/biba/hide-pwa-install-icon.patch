@@ -1,0 +1,24 @@
+--- a/chrome/browser/ui/web_applications/pwa_install_page_action.cc
++++ b/chrome/browser/ui/web_applications/pwa_install_page_action.cc
+@@ -31,6 +31,8 @@
+ 
+ namespace {
+ 
++constexpr bool kBibaHideInstallIcon = true;
++
+ // Site engagement score threshold to show In-Product Help.
+ // Add x_ prefix so the IPH feature engagement tracker can ignore this.
+ const base::FeatureParam<int> kIphSiteEngagementThresholdParam{
+@@ -174,6 +176,12 @@
+ 
+ void PwaInstallPageActionController::Show(content::WebContents* web_contents,
+                                           bool showChip) {
++  // Biba (Dia): no "install app" icon in the address bar; installing stays
++  // available from the menu.
++  if (kBibaHideInstallIcon) {
++    Hide();
++    return;
++  }
+   // Controller responsible for all page actions
+   page_action_controller_->OverrideText(
+       kActionInstallPwa,

@@ -1,0 +1,294 @@
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -490,6 +490,21 @@
+       std::make_unique<ExtensionStateObserver>(this, profile());
+ }
+ 
++void BrowserCommandController::BibaSetFrameBlend(int other_space,
++                                                 float amount) {
++  if (other_space < 0 || amount <= 0.0f) {
++    other_space = -1;
++    amount = 0.0f;
++  }
++  if (other_space == biba_frame_blend_space_ &&
++      amount == biba_frame_blend_amount_) {
++    return;
++  }
++  biba_frame_blend_space_ = other_space;
++  biba_frame_blend_amount_ = amount;
++  RepaintBibaFrame();
++}
++
+ int BrowserCommandController::biba_active_space() const {
+   return biba_spaces_ ? biba_spaces_->active_space() : 0;
+ }
+--- a/chrome/browser/ui/browser_command_controller.h
++++ b/chrome/browser/ui/browser_command_controller.h
+@@ -129,6 +129,12 @@
+   // Biba: index of the Space shown in this window (0 when Spaces were never
+   // used).
+   int biba_active_space() const;
++  // Biba: frame colour cross-fade. The frame shows the active Space's colour
++  // blended `amount` (0..1) toward Space `other_space`'s colour. Used while
++  // swiping and right after a switch, so the colour never jumps.
++  void BibaSetFrameBlend(int other_space, float amount);
++  int biba_frame_blend_space() const { return biba_frame_blend_space_; }
++  float biba_frame_blend_amount() const { return biba_frame_blend_amount_; }
+   // Biba: whether Space `index` exists (visible or holding parked tabs).
+   bool biba_space_in_use(int index) const;
+   // Biba: titles + favicons of a parked Space (empty for the visible one).
+@@ -313,6 +319,8 @@
+ 
+   // Biba: Spaces of this window. Created on first use.
+   base::RepeatingCallbackList<void(int, int)> biba_space_changed_callbacks_;
++  int biba_frame_blend_space_ = -1;
++  float biba_frame_blend_amount_ = 0.0f;
+   int biba_last_space_ = 0;
+   std::unique_ptr<BibaSpacesController> biba_spaces_;
+ 
+--- a/chrome/browser/ui/views/frame/biba_frame_paint.cc
++++ b/chrome/browser/ui/views/frame/biba_frame_paint.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/views/frame/biba_frame_paint.h"
+ 
++#include <algorithm>
+ #include <array>
+ #include <cstdint>
+ #include <utility>
+@@ -110,11 +111,20 @@
+   }
+ 
+   int space = 0;
++  int blend_space = -1;
++  float blend_amount = 0.0f;
+   if (const auto* commands = chrome::BrowserCommandController::From(
+           const_cast<BrowserView*>(browser_view)->browser())) {
+     space = commands->biba_active_space();
++    blend_space = commands->biba_frame_blend_space();
++    blend_amount = commands->biba_frame_blend_amount();
++  }
++  SkColor accent = kSpaceAccents[space % kSpaceAccents.size()];
++  if (blend_space >= 0 && blend_amount > 0.0f) {
++    accent = color_utils::AlphaBlend(
++        kSpaceAccents[blend_space % kSpaceAccents.size()], accent,
++        std::min(1.0f, blend_amount));
+   }
+-  const SkColor accent = kSpaceAccents[space % kSpaceAccents.size()];
+ 
+   const bool dark = color_utils::IsDark(
+       view->GetColorProvider()->GetColor(ui::kColorSysSurface));
+--- a/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.cc
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.cc
+@@ -99,6 +99,11 @@
+ }
+ 
+ void BibaSpaceSwipeHandler::ScheduleSnapshot(base::TimeDelta delay) {
++  // Throttle, don't debounce: a page that keeps updating its title/favicon
++  // while loading must not postpone the snapshot forever.
++  if (snapshot_timer_.IsRunning()) {
++    return;
++  }
+   snapshot_timer_.Start(FROM_HERE, delay,
+                         base::BindOnce(&BibaSpaceSwipeHandler::CaptureSnapshot,
+                                        base::Unretained(this)));
+@@ -249,6 +254,31 @@
+   preview_space_ = -1;
+ }
+ 
++void BibaSpaceSwipeHandler::AnimateFrameBlendOut(int other, float amount,
++                                                 base::TimeDelta duration) {
++  blend_space_ = other;
++  blend_start_ = amount;
++  blend_animation_.SetSlideDuration(duration);
++  blend_animation_.SetTweenType(gfx::Tween::EASE_OUT);
++  blend_animation_.Reset(0.0);
++  blend_animation_.Show();
++}
++
++void BibaSpaceSwipeHandler::AnimationProgressed(
++    const gfx::Animation* animation) {
++  if (auto* commands = chrome::BrowserCommandController::From(browser_)) {
++    commands->BibaSetFrameBlend(
++        blend_space_,
++        blend_start_ * (1.0f - static_cast<float>(animation->GetCurrentValue())));
++  }
++}
++
++void BibaSpaceSwipeHandler::AnimationEnded(const gfx::Animation* animation) {
++  if (auto* commands = chrome::BrowserCommandController::From(browser_)) {
++    commands->BibaSetFrameBlend(-1, 0.0f);
++  }
++}
++
+ void BibaSpaceSwipeHandler::BeginTracking() {
+   tracking_ = true;
+   accumulated_x_ = 0.0f;
+@@ -307,12 +337,21 @@
+   const float width = std::max(1, sidebar_->width());
+   const float progress = std::min(1.0f, std::fabs(offset) / width);
+   SetOffset(offset, 1.0f - (1.0f - kMinOpacity) * progress);
+-  // The neighbouring Space slides in right next to the outgoing list.
++  // The neighbouring Space slides in right next to the outgoing list, and the
++  // frame colour follows the fingers toward it.
++  blend_animation_.Stop();
++  auto* commands = chrome::BrowserCommandController::From(browser_);
+   if (neighbour >= 0) {
+-    ShowPreview(neighbour, offset + direction * width,
+-                kMinOpacity + (1.0f - kMinOpacity) * progress);
++    handoff_opacity_ = kMinOpacity + (1.0f - kMinOpacity) * progress;
++    ShowPreview(neighbour, offset + direction * width, handoff_opacity_);
++    if (commands) {
++      commands->BibaSetFrameBlend(neighbour, progress);
++    }
+   } else {
+     HidePreview();
++    if (commands) {
++      commands->BibaSetFrameBlend(-1, 0.0f);
++    }
+   }
+ }
+ 
+@@ -330,13 +369,27 @@
+     // the opposite side of the current offset so the motion is continuous.
+     handoff_offset_ = offset_ + direction * width;
+     if (auto* commands = chrome::BrowserCommandController::From(browser_)) {
++      // After the switch the frame shows the new Space; keep showing what the
++      // fingers left (old colour at 1 - progress) and fade it out.
++      const float progress = commands->biba_frame_blend_amount();
++      const int from = commands->biba_active_space();
++      commands->BibaSetFrameBlend(-1, 0.0f);
+       commands->ExecuteCommand(IDC_BIBA_SWITCH_SPACE_0 + target);
++      commands->BibaSetFrameBlend(from, 1.0f - progress);
++      AnimateFrameBlendOut(from, 1.0f - progress, kSlideDuration);
+     }
+     return;
+   }
+   if (offset_ != 0.0f) {
+     AnimateToRest(kSpringBackDuration);
+   }
++  // Cancelled: colour returns to the current Space.
++  if (auto* commands = chrome::BrowserCommandController::From(browser_);
++      commands && commands->biba_frame_blend_space() >= 0) {
++    AnimateFrameBlendOut(commands->biba_frame_blend_space(),
++                         commands->biba_frame_blend_amount(),
++                         kSpringBackDuration);
++  }
+   // Cancelled: the preview slides back out, then hides.
+   if (preview_ && preview_->GetVisible() && preview_->layer()) {
+     gfx::Transform out;
+@@ -357,8 +410,7 @@
+   if (from == to) {
+     return;
+   }
+-  // The real list takes over from the preview at the same position.
+-  HidePreview();
++  const bool from_swipe = handoff_offset_ != 0.0f;
+   const float width = std::max(1, sidebar_->width());
+   if (gfx::Animation::PrefersReducedMotion()) {
+     // Reduced motion: a plain cross-fade, no movement.
+@@ -369,11 +421,45 @@
+   }
+   // From a swipe: continue from where the fingers left the old list.
+   // Otherwise (dots, shortcuts): enter from the side the new Space lives on.
+-  const float start = handoff_offset_ != 0.0f
++  const float start = from_swipe
+                           ? handoff_offset_
+                           : (to > from ? 1.0f : -1.0f) * 0.35f * width;
++  const float start_opacity = from_swipe ? handoff_opacity_ : kMinOpacity;
+   handoff_offset_ = 0.0f;
+-  SetOffset(start, kMinOpacity);
+-  AnimateToRest(kSlideDuration);
++  const bool snapshot_handoff = from_swipe && preview_ &&
++                                preview_->GetVisible() && preview_->layer() &&
++                                snapshots_.count(to);
++  if (snapshot_handoff) {
++    // The snapshot (same pixels as the real list) finishes the motion alone;
++    // the real list, which Chromium is still rebuilding, stays hidden at rest
++    // and is swapped in for the snapshot in a single frame at the end. Showing
++    // both at once would double rows such as "+ New Tab".
++    SetOffset(0.0f, 0.0f);
++    views::AnimationBuilder()
++        .SetPreemptionStrategy(
++            ui::LayerAnimator::IMMEDIATELY_ANIMATE_TO_NEW_TARGET)
++        .OnEnded(base::BindOnce(
++            [](BibaSpaceSwipeHandler* self) {
++              self->SetOffset(0.0f, 1.0f);
++              self->HidePreview();
++            },
++            base::Unretained(this)))
++        .Once()
++        .SetDuration(kSlideDuration)
++        .SetTransform(preview_->layer(), gfx::Transform(),
++                      gfx::Tween::ACCEL_20_DECEL_100)
++        .SetOpacity(preview_->layer(), 1.0f, gfx::Tween::EASE_OUT);
++  } else {
++    HidePreview();
++    SetOffset(start, start_opacity);
++    AnimateToRest(kSlideDuration);
++  }
++  if (!from_swipe) {
++    // Shortcut / dots: cross-fade the frame colour from the old Space.
++    if (auto* commands = chrome::BrowserCommandController::From(browser_)) {
++      commands->BibaSetFrameBlend(from, 1.0f);
++    }
++    AnimateFrameBlendOut(from, 1.0f, kSlideDuration);
++  }
+   ScheduleSnapshot(kSlideDuration + base::Milliseconds(50));
+ }
+--- a/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.h
++++ b/chrome/browser/ui/views/tabs/vertical/biba_space_swipe_handler.h
+@@ -18,6 +18,8 @@
+ #include "ui/gfx/image/image_skia.h"
+ #include "base/time/time.h"
+ #include "ui/events/event_handler.h"
++#include "ui/gfx/animation/animation_delegate.h"
++#include "ui/gfx/animation/slide_animation.h"
+ 
+ class BibaSpacePreviewView;
+ class BrowserWindowInterface;
+@@ -38,7 +40,8 @@
+ //
+ // Only the views returned by `movable_views` move; the Space dots stay put.
+ class BibaSpaceSwipeHandler : public ui::EventHandler,
+-                              public TabStripModelObserver {
++                              public TabStripModelObserver,
++                              public gfx::AnimationDelegate {
+  public:
+   using MovableViewsGetter = base::RepeatingCallback<std::vector<views::View*>()>;
+ 
+@@ -50,6 +53,10 @@
+   BibaSpaceSwipeHandler& operator=(const BibaSpaceSwipeHandler&) = delete;
+   ~BibaSpaceSwipeHandler() override;
+ 
++  // gfx::AnimationDelegate (frame colour cross-fade):
++  void AnimationProgressed(const gfx::Animation* animation) override;
++  void AnimationEnded(const gfx::Animation* animation) override;
++
+   // ui::EventHandler:
+   void OnScrollEvent(ui::ScrollEvent* event) override;
+ 
+@@ -73,6 +80,9 @@
+   // Shows Space `space` as a preview at `offset` (loads it if needed).
+   void ShowPreview(int space, float offset, float opacity);
+   void HidePreview();
++  // Fades the frame colour from `amount` toward Space `other` back to the
++  // active Space's colour over `duration`.
++  void AnimateFrameBlendOut(int other, float amount, base::TimeDelta duration);
+   // Snapshots the visible Space's tab list (only when it's at rest).
+   void ScheduleSnapshot(base::TimeDelta delay);
+   void CaptureSnapshot();
+@@ -101,6 +111,13 @@
+   // Pixel snapshots of each Space's tab list, taken while it was visible.
+   std::map<int, gfx::ImageSkia> snapshots_;
+   base::OneShotTimer snapshot_timer_;
++
++  gfx::SlideAnimation blend_animation_{this};
++  int blend_space_ = -1;
++  float blend_start_ = 0.0f;
++  // Opacity of the preview when the swipe committed (the real list starts
++  // from it, so nothing pops).
++  float handoff_opacity_ = 1.0f;
+   base::WeakPtrFactory<BibaSpaceSwipeHandler> weak_factory_{this};
+ };
+ 

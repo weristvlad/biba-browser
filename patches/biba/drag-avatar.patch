@@ -1,0 +1,549 @@
+--- a/chrome/browser/ui/views/tabs/common/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/common/BUILD.gn
+@@ -47,6 +47,8 @@
+ source_set("impl") {
+   sources = [
+     "dragged_tabs_container.cc",
++    "biba_drag_avatar.cc",
++    "biba_drag_avatar.h",
+     "horizontal_tab_style_views.cc",
+     "horizontal_tab_style_views.h",
+     "pinned_tab_container_view.cc",
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/common/biba_drag_avatar.cc
+@@ -0,0 +1,181 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/common/biba_drag_avatar.h"
++
++#include <utility>
++
++#include "cc/paint/paint_flags.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/compositor/layer.h"
++#include "ui/color/color_id.h"
++#include "ui/color/color_provider.h"
++#include "ui/gfx/animation/tween.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/color_utils.h"
++#include "ui/gfx/font_list.h"
++#include "ui/gfx/geometry/rect_f.h"
++#include "ui/gfx/geometry/transform.h"
++#include "ui/gfx/scoped_canvas.h"
++#include "ui/gfx/shadow_value.h"
++#include "ui/gfx/skia_paint_util.h"
++#include "ui/gfx/text_constants.h"
++
++namespace {
++
++// Dia's "firm" spring settles in about a quarter second.
++constexpr base::TimeDelta kMorphDuration = base::Milliseconds(240);
++constexpr base::TimeDelta kLandDuration = base::Milliseconds(220);
++constexpr int kCornerRadius = 10;
++constexpr int kIconSize = 16;
++constexpr int kIconInset = 9;
++constexpr int kTitleGap = 8;
++
++int Lerp(int a, int b, double t) {
++  return a + static_cast<int>((b - a) * t + (b > a ? 0.5 : -0.5));
++}
++
++}  // namespace
++
++BibaDragAvatar::BibaDragAvatar(gfx::ImageSkia favicon,
++                               std::u16string title,
++                               gfx::Size row_size,
++                               gfx::Size tile_size,
++                               bool tile,
++                               gfx::Vector2dF grab)
++    : favicon_(std::move(favicon)),
++      title_(std::move(title)),
++      row_size_(row_size),
++      tile_size_(tile_size),
++      grab_(grab) {
++  SetCanProcessEventsWithinSubtree(false);
++  SetPaintToLayer();
++  layer()->SetFillsBoundsOpaquely(false);
++  morph_.SetSlideDuration(kMorphDuration);
++  morph_.SetTweenType(gfx::Tween::FAST_OUT_SLOW_IN);
++  morph_.Reset(tile ? 1.0 : 0.0);
++  land_.SetSlideDuration(kLandDuration);
++  land_.SetTweenType(gfx::Tween::FAST_OUT_SLOW_IN);
++}
++
++BibaDragAvatar::~BibaDragAvatar() = default;
++
++void BibaDragAvatar::MoveTo(const gfx::Point& pointer) {
++  pointer_ = pointer;
++  if (!land_.is_animating()) {
++    UpdateBounds();
++  }
++}
++
++void BibaDragAvatar::SetTile(bool tile) {
++  if (tile) {
++    morph_.Show();
++  } else {
++    morph_.Hide();
++  }
++}
++
++void BibaDragAvatar::FlyTo(const gfx::Rect& target,
++                           bool tile,
++                           base::OnceClosure done) {
++  land_from_ = bounds();
++  land_from_.Inset(kShadowMargin);
++  land_to_ = target;
++  land_done_ = std::move(done);
++  SetTile(tile);
++  land_.Reset(0.0);
++  land_.Show();
++}
++
++gfx::Rect BibaDragAvatar::ShapeRect() const {
++  gfx::Rect rect = GetLocalBounds();
++  rect.Inset(kShadowMargin);
++  return rect;
++}
++
++void BibaDragAvatar::UpdateBounds() {
++  gfx::Rect shape;
++  if (land_.is_animating() || land_.GetCurrentValue() > 0.0) {
++    shape = gfx::Tween::RectValueBetween(land_.GetCurrentValue(), land_from_,
++                                         land_to_);
++  } else {
++    const double m = morph_.GetCurrentValue();
++    const gfx::Size size(Lerp(row_size_.width(), tile_size_.width(), m),
++                         Lerp(row_size_.height(), tile_size_.height(), m));
++    shape = gfx::Rect(
++        pointer_.x() - static_cast<int>(grab_.x() * size.width()),
++        pointer_.y() - static_cast<int>(grab_.y() * size.height()),
++        size.width(), size.height());
++  }
++  shape.Outset(kShadowMargin);
++  SetBoundsRect(shape);
++  SchedulePaint();
++}
++
++void BibaDragAvatar::OnPaint(gfx::Canvas* canvas) {
++  const ui::ColorProvider* colors = GetColorProvider();
++  const bool dark =
++      colors && color_utils::IsDark(colors->GetColor(ui::kColorSysSurface));
++  const gfx::Rect shape = ShapeRect();
++  const double m = morph_.GetCurrentValue();
++
++  // Lifted card with a soft shadow.
++  cc::PaintFlags fill;
++  fill.setAntiAlias(true);
++  fill.setColor(dark ? SkColorSetRGB(0x3A, 0x3A, 0x40)
++                     : SkColorSetARGB(0xF5, 0xFF, 0xFF, 0xFF));
++  fill.setLooper(gfx::CreateShadowDrawLooper(
++      {gfx::ShadowValue(gfx::Vector2d(0, 4), 18,
++                        SkColorSetA(SK_ColorBLACK, dark ? 0x70 : 0x30))}));
++  canvas->DrawRoundRect(gfx::RectF(shape), kCornerRadius, fill);
++
++  // The icon slides from the row's leading edge to the tile's centre.
++  const int icon_x =
++      Lerp(shape.x() + kIconInset, shape.CenterPoint().x() - kIconSize / 2, m);
++  const int icon_y = shape.CenterPoint().y() - kIconSize / 2;
++  if (!favicon_.isNull()) {
++    canvas->DrawImageInt(favicon_, 0, 0, favicon_.width(), favicon_.height(),
++                         icon_x, icon_y, kIconSize, kIconSize,
++                         /*filter=*/true);
++  }
++
++  // The title fades out as the row becomes a tile.
++  const SkAlpha title_alpha = static_cast<SkAlpha>((1.0 - m) * 255);
++  if (title_alpha > 4 && !title_.empty()) {
++    gfx::ScopedCanvas clip(canvas);
++    canvas->ClipRect(shape);
++    const SkColor text = colors ? colors->GetColor(ui::kColorSysOnSurface)
++                                : SK_ColorBLACK;
++    const int text_x = icon_x + kIconSize + kTitleGap;
++    canvas->DrawStringRectWithFlags(
++        title_, gfx::FontList().DeriveWithSizeDelta(1),
++        SkColorSetA(text, title_alpha),
++        gfx::Rect(text_x, shape.y(), shape.right() - text_x - kIconInset,
++                  shape.height()),
++        gfx::Canvas::NO_SUBPIXEL_RENDERING);
++  }
++}
++
++void BibaDragAvatar::AnimationProgressed(const gfx::Animation* animation) {
++  UpdateBounds();
++}
++
++void BibaDragAvatar::AnimationEnded(const gfx::Animation* animation) {
++  UpdateBounds();
++  if (animation == &land_ && land_done_) {
++    std::move(land_done_).Run();
++  }
++}
++
++void BibaHideDraggedView(views::View* view) {
++  view->SetTransform(gfx::Transform());
++  if (!view->layer()) {
++    view->SetPaintToLayer();
++    view->layer()->SetFillsBoundsOpaquely(false);
++  }
++  view->layer()->SetOpacity(0.0f);
++}
++
++BEGIN_METADATA(BibaDragAvatar)
++END_METADATA
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/common/biba_drag_avatar.h
+@@ -0,0 +1,88 @@
++// Copyright 2026 The Biba Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_COMMON_BIBA_DRAG_AVATAR_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_COMMON_BIBA_DRAG_AVATAR_H_
++
++#include <string>
++
++#include "base/functional/callback.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/gfx/animation/animation_delegate.h"
++#include "ui/gfx/animation/slide_animation.h"
++#include "ui/gfx/geometry/point.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/size.h"
++#include "ui/gfx/geometry/vector2d_f.h"
++#include "ui/gfx/image/image_skia.h"
++#include "ui/views/view.h"
++
++// Biba (Dia/Arc): the floating copy of a tab dragged in the sidebar. It
++// follows the pointer and morphs between a tab row and a pinned tile as it
++// crosses between the list and the tiles, while the real tab stays in its
++// slot as a faint ghost and the others make room around it. On drop it flies
++// into the tab's final place.
++class BibaDragAvatar : public views::View, public gfx::AnimationDelegate {
++  METADATA_HEADER(BibaDragAvatar, views::View)
++
++ public:
++  // `grab` is where the pointer holds the tab, as a fraction of its size.
++  BibaDragAvatar(gfx::ImageSkia favicon,
++                 std::u16string title,
++                 gfx::Size row_size,
++                 gfx::Size tile_size,
++                 bool tile,
++                 gfx::Vector2dF grab);
++  BibaDragAvatar(const BibaDragAvatar&) = delete;
++  BibaDragAvatar& operator=(const BibaDragAvatar&) = delete;
++  ~BibaDragAvatar() override;
++
++  // Pointer position in the parent's coordinates.
++  void MoveTo(const gfx::Point& pointer);
++  // Morphs toward a tile (true) or a row (false).
++  void SetTile(bool tile);
++  // Flies to `target` (parent coordinates), then runs `done`.
++  void FlyTo(const gfx::Rect& target, bool tile, base::OnceClosure done);
++
++  // views::View:
++  void OnPaint(gfx::Canvas* canvas) override;
++
++  // gfx::AnimationDelegate:
++  void AnimationProgressed(const gfx::Animation* animation) override;
++  void AnimationEnded(const gfx::Animation* animation) override;
++
++  // Room around the shape for its shadow.
++  static constexpr int kShadowMargin = 14;
++
++ private:
++  // The shape's rect (without shadow margin) for the current state.
++  gfx::Rect ShapeRect() const;
++  void UpdateBounds();
++
++  const gfx::ImageSkia favicon_;
++  const std::u16string title_;
++  const gfx::Size row_size_;
++  const gfx::Size tile_size_;
++  const gfx::Vector2dF grab_;
++  gfx::Point pointer_;
++
++  // 0 = row, 1 = tile.
++  gfx::SlideAnimation morph_{this};
++
++  // Landing: from the floating rect to `land_to_`.
++  gfx::SlideAnimation land_{this};
++  gfx::Rect land_from_;
++  gfx::Rect land_to_;
++  base::OnceClosure land_done_;
++};
++
++// True while a sidebar drag shows a BibaDragAvatar (defined in
++// tab_drag_handler.cc).
++bool BibaDragAvatarActive();
++
++// Keeps a dragged tab's real view in its slot but invisible (the avatar is
++// what the user sees).
++void BibaHideDraggedView(views::View* view);
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_COMMON_BIBA_DRAG_AVATAR_H_
+--- a/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc
++++ b/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/views/tabs/common/dragged_tabs_container.h"
+ 
++#include "chrome/browser/ui/views/tabs/common/biba_drag_avatar.h"
++
+ #include <algorithm>
+ 
+ #include "base/auto_reset.h"
+@@ -227,6 +229,11 @@
+ void DraggedTabsContainer::InitializeDragStartAnimation(
+     const TabDragTarget::DragController& controller) {
+   CHECK(animating_views_start_offsets_.empty());
++  // Biba: in the sidebar the floating avatar does the motion; the dragged
++  // views stay in place as ghosts (and may have just moved containers).
++  if (BibaDragAvatarActive()) {
++    return;
++  }
+ 
+   // Duration of the animation for dragged views to become contiguous.
+   static constexpr base::TimeDelta kDragStartAnimationDuration =
+@@ -467,6 +474,12 @@
+   if (visual_data.should_hide && !drag_start_animation_.is_animating()) {
+     return;
+   }
++  // Biba (Dia): the sidebar's floating avatar follows the pointer; the real
++  // view stays in its slot, invisible, so the others make room around a gap.
++  if (BibaDragAvatarActive()) {
++    BibaHideDraggedView(dragged_view);
++    return;
++  }
+   // Use a transformation to render the dragged view, offset from its
+   // layout position.
+   gfx::Transform transform;
+--- a/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
+@@ -3,6 +3,12 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/ui/views/tabs/common/tab_drag_handler.h"
++#include <string_view>
++#include "chrome/browser/ui/layout_constants.h"
++#include "ui/views/view_class_properties.h"
++#include "ui/display/screen.h"
++#include "components/favicon/content/content_favicon_driver.h"
++#include "chrome/browser/ui/views/tabs/common/biba_drag_avatar.h"
+ 
+ #include <algorithm>
+ #include <memory>
+@@ -365,6 +371,7 @@
+     ResetDragState();
+     return false;
+   }
++  BibaUpdateAvatar(screen_location);
+   return true;
+ }
+ 
+@@ -473,6 +480,11 @@
+       if (tab_node && tab_node->view()) {
+         tab_drag_data.attached_view = &GetOrCreateSlotViewForNode(*tab_node);
+         tab_drag_data.pinned = pin;
++        // Hide the freshly made view at once so it never flashes next to the
++        // floating avatar.
++        if (BibaDragAvatarActive()) {
++          BibaHideDraggedView(tab_node->view());
++        }
+       }
+     }
+     return;
+@@ -773,8 +785,144 @@
+   drag_controller_.reset();
+ }
+ 
++namespace {
++// Read by DraggedTabsContainer: while true, dragged views stay in their slot
++// as a ghost and the avatar does the moving.
++bool g_biba_avatar_active = false;
++}  // namespace
++
++bool BibaDragAvatarActive() {
++  return g_biba_avatar_active;
++}
++
++int TabDragHandlerImpl::BibaTileLine() const {
++  auto* tab_strip_view = views::AsViewClass<TabStripView>(
++      tab_strip_region_view_->GetTabStripView());
++  if (!tab_strip_view || !tab_strip_view->unpinned_tabs_scroll_view()) {
++    return 0;
++  }
++  return tab_strip_view->unpinned_tabs_scroll_view()->GetBoundsInScreen().y() +
++         GetLayoutConstant(LayoutConstant::kVerticalTabHeight) / 2;
++}
++
++void TabDragHandlerImpl::BibaStartAvatar() {
++  views::View* region = &tab_strip_region_view_.get();
++  if (std::string_view(region->GetClassName()) !=
++          "VerticalTabStripRegionView" ||
++      !drag_controller_) {
++    return;
++  }
++  const DragSessionData& data = drag_controller_->GetSessionData();
++  if (!data.dragging_groups.empty() || !data.source_view_drag_data() ||
++      !data.source_view_drag_data()->contents ||
++      !IsLiveSlotView(data.source_view_drag_data()->attached_view)) {
++    return;
++  }
++  content::WebContents* contents = data.source_view_drag_data()->contents;
++  views::View* source_view =
++      ViewFromTabSlot(data.source_view_drag_data()->attached_view);
++  if (!source_view) {
++    return;
++  }
++  const gfx::Rect source = source_view->GetBoundsInScreen();
++  const gfx::Point cursor = display::Screen::Get()->GetCursorScreenPoint();
++  const gfx::Vector2dF grab(
++      source.width() ? std::clamp(float(cursor.x() - source.x()) /
++                                      source.width(), 0.0f, 1.0f)
++                     : 0.5f,
++      source.height() ? std::clamp(float(cursor.y() - source.y()) /
++                                       source.height(), 0.0f, 1.0f)
++                      : 0.5f);
++  const bool pinned = data.source_view_drag_data()->pinned;
++  const int row_height = GetLayoutConstant(LayoutConstant::kVerticalTabHeight);
++  const int tile_height =
++      GetLayoutConstant(LayoutConstant::kVerticalTabPinnedHeight);
++  auto* tab_strip_view = views::AsViewClass<TabStripView>(
++      tab_strip_region_view_->GetTabStripView());
++  const int row_width = tab_strip_view && tab_strip_view->unpinned_tabs_scroll_view()
++                            ? tab_strip_view->unpinned_tabs_scroll_view()->width() - 12
++                            : source.width();
++  const gfx::Size row_size(pinned ? row_width : source.width(), row_height);
++  const gfx::Size tile_size(
++      pinned ? source.width() : std::max(tile_height, (row_width - 12) / 3),
++      tile_height);
++  gfx::ImageSkia favicon;
++  if (auto* driver = favicon::ContentFaviconDriver::FromWebContents(contents)) {
++    favicon = driver->GetFavicon().AsImageSkia();
++  }
++  auto* avatar = region->AddChildView(std::make_unique<BibaDragAvatar>(
++      favicon, contents->GetTitle(), row_size, tile_size, pinned, grab));
++  avatar->SetProperty(views::kViewIgnoredByLayoutKey, true);
++  biba_avatar_.SetView(avatar);
++  g_biba_avatar_active = true;
++  BibaUpdateAvatar(cursor);
++}
++
++void TabDragHandlerImpl::BibaUpdateAvatar(const gfx::Point& point_in_screen) {
++  auto* avatar = static_cast<BibaDragAvatar*>(biba_avatar_.view());
++  if (!avatar || !avatar->parent()) {
++    return;
++  }
++  gfx::Point point = point_in_screen;
++  views::View::ConvertPointFromScreen(avatar->parent(), &point);
++  avatar->SetTile(point_in_screen.y() < BibaTileLine());
++  avatar->MoveTo(point);
++}
++
++void TabDragHandlerImpl::BibaLandAvatar() {
++  g_biba_avatar_active = false;
++  auto* avatar = static_cast<BibaDragAvatar*>(biba_avatar_.view());
++  biba_avatar_.SetView(nullptr);
++  if (!avatar || !avatar->parent()) {
++    return;
++  }
++  views::View* parent = avatar->parent();
++  auto remove = base::BindOnce(
++      [](std::unique_ptr<views::ViewTracker> tracker) {
++        if (views::View* view = tracker->view(); view && view->parent()) {
++          view->parent()->RemoveChildViewT(view);
++        }
++      },
++      std::make_unique<views::ViewTracker>(avatar));
++  // Land where the tab ended up.
++  gfx::Rect target;
++  bool tile = false;
++  if (drag_controller_) {
++    const DragSessionData& data = drag_controller_->GetSessionData();
++    if (data.source_view_drag_data() && data.source_view_drag_data()->contents) {
++      tabs::TabInterface* tab = tabs::TabInterface::GetFromContents(
++          data.source_view_drag_data()->contents);
++      TabCollectionNode* node =
++          tab ? root_node_->GetNodeForHandle(tab->GetHandle()) : nullptr;
++      if (node && node->view()) {
++        biba_landing_view_.SetView(node->view());
++        BibaHideDraggedView(node->view());
++        target = node->view()->GetBoundsInScreen();
++        gfx::Point origin = target.origin();
++        views::View::ConvertPointFromScreen(parent, &origin);
++        target.set_origin(origin);
++        tile = tab->IsPinned();
++      }
++    }
++  }
++  if (target.IsEmpty()) {
++    std::move(remove).Run();
++    return;
++  }
++  // Reveal the real tab only once the avatar has landed on it.
++  auto reveal = base::BindOnce(
++      [](std::unique_ptr<views::ViewTracker> landing) {
++        if (views::View* view = landing->view()) {
++          view->DestroyLayer();
++        }
++      },
++      std::make_unique<views::ViewTracker>(biba_landing_view_.view()));
++  avatar->FlyTo(target, tile, std::move(remove).Then(std::move(reveal)));
++}
++
+ void TabDragHandlerImpl::StartedDragging(
+     const std::vector<TabSlotView*>& views) {
++  BibaStartAvatar();
+   const auto& drag_data = drag_controller_->GetSessionData();
+   if (base::FeatureList::IsEnabled(features::kCollapseTabGroupDuringDrag) &&
+       drag_data.group_header_drag_data_.has_value()) {
+@@ -847,11 +995,15 @@
+ void TabDragHandlerImpl::StoppedDragging() {
+   expand_on_hover_lock_.reset();
+   scroll_synchronizers_.clear();
++  BibaLandAvatar();
+ 
+   for (auto& [_, slot_view] : slot_views_) {
+     views::View* dragged_view = ViewFromTabSlot(slot_view);
+     CHECK(dragged_view);
+-    dragged_view->DestroyLayer();
++    // Biba: the view the avatar lands on stays hidden until it has landed.
++    if (dragged_view != biba_landing_view_.view()) {
++      dragged_view->DestroyLayer();
++    }
+     dragged_view->ClearProperty(kOffsetAtTabDragStart);
+   }
+ 
+--- a/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
++++ b/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
+@@ -10,6 +10,7 @@
+ #include <vector>
+ 
+ #include "base/callback_list.h"
++#include "ui/views/view_tracker.h"
+ #include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/raw_ref.h"
+@@ -145,6 +146,19 @@
+   views::View* ViewFromTabSlot(TabSlotView* view) const override;
+   // Biba: whether `slot_view` is one this handler still owns.
+   bool IsLiveSlotView(const TabSlotView* slot_view) const;
++
++ private:
++  // Biba (Dia): the floating copy of the dragged tab in the sidebar.
++  void BibaStartAvatar();
++  void BibaUpdateAvatar(const gfx::Point& point_in_screen);
++  void BibaLandAvatar();
++  views::ViewTracker biba_avatar_;
++  // The real tab view the avatar is landing on (kept hidden until then).
++  views::ViewTracker biba_landing_view_;
++  // Screen y above which a dragged tab becomes a pinned tile.
++  int BibaTileLine() const;
++
++ public:
+   std::optional<gfx::Vector2d> GetOffsetFromSourceAtDragStart(
+       views::View* view) const override;
+   std::optional<BrowserRootView::DropIndex> GetLinkDropIndexForNode(
