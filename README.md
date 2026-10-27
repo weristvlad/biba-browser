@@ -57,16 +57,18 @@ Huge thanks to the Helium and ungoogled-chromium people.
 Beta, macOS (Apple Silicon) first. Things that are still rough:
 
 - Tab drag between the tiles and the list can still flicker.
-- Pinned *links* (Dia-style rows above a divider) are not done yet.
+- Pinned links (Dia-style rows above a divider) are new; dragging them
+  around may still misbehave.
 - No Windows/Linux builds yet.
 
 ## Install
 
 Grab the latest `.dmg` from
 [Releases](https://github.com/weristvlad/biba-browser/releases) or
-[bibabrowser.com](https://bibabrowser.com), drag Biba to Applications. Biba
-isn't notarized yet, so the first time right-click it and choose **Open**.
-After that it updates itself from GitHub Releases (Sparkle, EdDSA-signed).
+[bibabrowser.com](https://bibabrowser.com) and drag Biba to Applications.
+It is signed and notarized by Apple, so it opens like any other app, and it
+updates itself from GitHub Releases (Sparkle, EdDSA-signed). Needs an Apple
+Silicon Mac with macOS 12 or later.
 
 To publish a release: `scripts/release.sh <version> --publish` builds,
 packages, signs the update and uploads the DMG plus `appcast-arm64.xml`.

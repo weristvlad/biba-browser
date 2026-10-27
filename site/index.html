@@ -270,6 +270,12 @@
       .then(r => r.ok ? r.json() : null)
       .then(release => {
         const dmg = release && release.assets.find(a => a.name.endsWith(".dmg"));
+        const beta = document.querySelector(".beta");
+        if (dmg && beta) {
+          const mb = Math.round(dmg.size / 1e6);
+          beta.innerHTML = `<strong>Public beta ${release.tag_name.replace(/^v/, "")}.</strong> ` +
+            `For Apple Silicon Macs, macOS 12 or later. ${mb} MB, signed and notarized.`;
+        }
         for (const button of document.querySelectorAll(".download")) {
           if (dmg) {
             button.href = dmg.browser_download_url;
