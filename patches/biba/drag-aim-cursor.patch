@@ -1,0 +1,34 @@
+--- a/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc
++++ b/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc
+@@ -116,6 +116,14 @@
+ 
+   gfx::Rect dragged_bounds_in_container =
+       GetDraggingViewsBoundsAtPoint(point_in_container);
++  // Biba: the floating avatar rides on the cursor, so aim with the cursor:
++  // centre the dragged box on it instead of keeping the grab offset.
++  if (BibaDragAvatarActive()) {
++    dragged_bounds_in_container.set_origin(
++        point_in_container -
++        gfx::Vector2d(dragged_bounds_in_container.width() / 2,
++                      dragged_bounds_in_container.height() / 2));
++  }
+ 
+   auto* scroll_view = GetScrollViewForContainer();
+   CHECK(scroll_view);
+@@ -743,8 +751,14 @@
+     // drag falls on. Once the row is found, delegate to
+     // `GetTargetForTabDragInRow` to find the exact node within the row.
+     if (IsHorizontalDragSupported()) {
+-      if (IsVerticalDragSupported() &&
+-          dragged_tab_bounds.y() > child_layout.bounds.CenterPoint().y()) {
++      // Biba: pick the tile row the cursor (box centre) is over, rather
++      // than comparing the box's top edge with the row's middle.
++      const bool past_row =
++          BibaDragAvatarActive()
++              ? dragged_tab_bounds.CenterPoint().y() >=
++                    child_layout.bounds.bottom()
++              : dragged_tab_bounds.y() > child_layout.bounds.CenterPoint().y();
++      if (IsVerticalDragSupported() && past_row) {
+         continue;
+       }
+ 
